@@ -152,7 +152,7 @@ Une erreur SQLite renvoie HTTP 503 au lieu de confirmer un enregistrement échou
 
 Ces données arrivent dans le corps JSON du POST envoyé par ESUP à notre route
 `/esup/events`. À ce stade, le connecteur reçoit une notification : il consulte ensuite l’API ESUP si `ESUP_URL` est configurée.
-Le document PDF n’est pas encore téléchargé.
+Le PDF courant est téléchargé uniquement si la dernière étape est identifiée.
 
 | Champ | Signification | Utilité pour le POC |
 | --- | --- | --- |
@@ -251,7 +251,7 @@ Le résultat est conservé dans une table `observations` (une observation par
 
 Le journal affiche seulement les identifiants et le résultat. Les identités et
 placements sont dans SQLite. Les coordonnées ne sont pas encore converties pour
-Yousign ; aucun PDF n'est téléchargé, aucune demande n'est envoyée ou clôturée.
+Yousign ; le PDF courant est téléchargé, mais aucune demande n’est envoyée ou clôturée.
 
 La consultation se fait après la réponse HTTP, dans le même processus. Ce n'est
 pas une file de travail persistante : un arrêt du service peut laisser un événement
@@ -279,3 +279,24 @@ Adapter les chemins si les variables de déploiement ont été changées.
 Cette commande relit l'état actuel d'ESUP et imprime l'observation ; elle ne
 modifie pas le parapheur. Elle fonctionne aussi pour les événements enregistrés
 avant cette évolution. La table `observations` est créée sans effacer `events`.
+
+
+## PDF de la dernière étape
+
+Après identification de la dernière étape, le connecteur télécharge le PDF courant
+via `GET /ws/signrequests/get-last-file/{id}`. Il le conserve à côté de la base :
+`documents/<id_demande>/<id_etape>/document.pdf`, soit sous
+`/var/lib/yousign-connector/documents/` avec la configuration du playbook.
+Le chemin est enregistré dans `observations.resultat`, champ `document_pdf`.
+Aucune variable supplémentaire ni modification du playbook n'est nécessaire.
+
+Le téléchargement utilise un fichier temporaire privé, renommé une fois terminé.
+Le programme vérifie l'en-tête PDF, sa terminaison et, si fournie par ESUP, la
+longueur annoncée. Ce ne sont pas une validation complète du PDF ni une vérification
+cryptographique des signatures. Une erreur laisse l'événement en `erreur` avec un
+motif ; un éventuel ancien PDF reste intact. La commande de reprise retélécharge
+le document courant et remplace le fichier après vérification.
+
+Le connecteur ne télécharge rien pour les étapes intermédiaires. Il ne transmet
+encore aucun document à Yousign et ne modifie pas ESUP. Les téléchargements déjà
+conservés ne sont pas supprimés automatiquement.

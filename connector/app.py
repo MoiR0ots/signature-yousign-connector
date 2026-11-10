@@ -13,7 +13,7 @@ from pathlib import Path
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException
 
-from connector.esup import analyser_demande, lire_demande
+from connector.esup import analyser_demande, lire_demande, telecharger_document
 
 
 # CONNECTOR_DB permet de choisir le fichier au lancement du programme.
@@ -159,10 +159,19 @@ def consulter_evenement(identifiant_evenement):
             # TODO avant production : reprendre automatiquement les événements
             # bloqués et les signaler (voir le début du README). Pour l'instant,
             # a_reprendre ne déclenche rien, même après un redémarrage du service.
+            if resultat["etat"] == "derniere_etape":
+                # Les documents suivent le dossier de la base : aucun chemin
+                # supplémentaire à configurer dans le playbook.
+                resultat["document_pdf"] = telecharger_document(
+                    evenement["signRequestId"], resultat["id_etape"],
+                    CHEMIN_BASE.parent / "documents",
+                )
     except Exception as erreur:
         # Cette frontière protège la réception des erreurs réseau ou d'un format
         # ESUP inattendu. Le type d'erreur est conservé sans exposer la réponse API.
         resultat = {"etat": "erreur", "motif": type(erreur).__name__}
+        if isinstance(erreur, ValueError):
+            resultat["detail"] = str(erreur)
 
     connexion = sqlite3.connect(CHEMIN_BASE, timeout=10)
     try:

@@ -1,10 +1,21 @@
 """Vérifier la règle métier avec un circuit fictif, sans serveur ESUP."""
 
 import sqlite3
+import json
+import pytest
 from urllib.error import URLError
 
 from connector import app as connecteur
 from connector.esup import analyser_demande
+
+
+@pytest.fixture(autouse=True)
+def remplacer_telechargement(monkeypatch):
+    """Ces tests de circuit ne doivent pas télécharger un vrai document."""
+    monkeypatch.setattr(
+        connecteur, "telecharger_document",
+        lambda demande, etape, dossier: str(dossier / demande / str(etape) / "document.pdf"),
+    )
 
 
 def construire_demande():
@@ -66,6 +77,8 @@ def test_erreur_puis_reprise_sans_perdre_evenement(tmp_path, monkeypatch):
         assert connexion.execute("SELECT count(*) FROM events").fetchone()[0] == 1
         assert connexion.execute("SELECT state FROM events").fetchone()[0] == "derniere_etape"
         assert connexion.execute("SELECT count(*) FROM observations").fetchone()[0] == 1
+        observation = json.loads(connexion.execute("SELECT resultat FROM observations").fetchone()[0])
+        assert observation["document_pdf"].endswith("/documents/105/40/document.pdf")
     finally:
         connexion.close()
 
@@ -132,3 +145,20 @@ def test_decalage_persistant_reste_a_reprendre(tmp_path, monkeypatch):
         assert connexion.execute("SELECT state FROM events").fetchone()[0] == "a_reprendre"
     finally:
         connexion.close()
+
+
+def test_echec_pdf_marque_evenement_en_erreur(tmp_path, monkeypatch):
+    monkeypatch.setattr(connecteur, "CHEMIN_BASE", tmp_path / "events.sqlite3")
+    monkeypatch.setattr(connecteur, "lire_demande", lambda identifiant: construire_demande())
+
+    def reponse_non_pdf(demande, etape, dossier):
+        raise ValueError("La réponse ESUP n'est pas un PDF")
+
+    monkeypatch.setattr(connecteur, "telecharger_document", reponse_non_pdf)
+    reception = connecteur.enregistrer_evenement(
+        {"signRequestId": "105", "status": "pending", "step": "2"}
+    )
+    resultat = connecteur.consulter_evenement(reception["event_id"])
+    assert resultat["etat"] == "erreur"
+    assert resultat["detail"] == "La réponse ESUP n'est pas un PDF"
+    assert "document_pdf" not in resultat
