@@ -1,5 +1,23 @@
 # Connecteur ESUP / Yousign — première version
 
+## À régler avant la mise en production : reprise des événements
+
+**La reprise automatique n'est pas encore implémentée.** Après trois consultations
+espacées de 5 secondes, un décalage persistant avec ESUP laisse l'événement en
+`a_reprendre`. Cet état ne déclenche aucun traitement supplémentaire : sans reprise
+manuelle ou nouvelle notification identique, la demande reste bloquée indéfiniment
+côté connecteur. Un redémarrage du service ne la reprend pas non plus.
+
+Avant la production, il reste à :
+
+- reprendre automatiquement les événements `a_reprendre`, ainsi que les `erreur`
+  et les `received` laissés sans traitement après un arrêt ;
+- signaler les événements durablement bloqués pour qu'ils ne passent pas inaperçus ;
+- vérifier par un test qu'un événement est repris après une indisponibilité ESUP
+  et après un redémarrage du connecteur.
+
+Ce point reste ouvert même si les essais du POC passent grâce aux trois tentatives.
+
 Le programme reçoit les notifications ESUP et les garde dans un fichier SQLite.
 Il consulte le circuit ESUP lorsque `ESUP_URL` est configurée.
 Il ne contacte pas encore Yousign et ne modifie aucun parapheur ESUP.
@@ -228,6 +246,7 @@ Le résultat est conservé dans une table `observations` (une observation par
   ou étape intermédiaire ;
 - `derniere_etape` : dernière étape identifiée, avec ses destinataires et leurs
   emplacements ESUP bruts ; cela ne signifie pas encore « prêt pour Yousign » ;
+- `a_reprendre` : l’API reste en retard après trois consultations ;
 - `erreur` : consultation impossible ou réponse inexploitable, avec le type d'erreur.
 
 Le journal affiche seulement les identifiants et le résultat. Les identités et
@@ -236,9 +255,14 @@ Yousign ; aucun PDF n'est téléchargé, aucune demande n'est envoyée ou clôtu
 
 La consultation se fait après la réponse HTTP, dans le même processus. Ce n'est
 pas une file de travail persistante : un arrêt du service peut laisser un événement
-`received`. Il n'y a pas de relance automatique pour le moment. Une notification
+`received`. Il n’y a pas de relance périodique automatique. Une notification
 doublonnée déclenche une nouvelle lecture, sans créer un nouvel événement.
-Si ESUP n'a pas encore finalisé sa transaction, une relecture peut être nécessaire.
+Si l’API annonce une étape antérieure ou un statut pas encore `pending` (hors
+statuts terminés ou refusés), le connecteur effectue au maximum trois lectures,
+espacées de **5 secondes** : une lecture immédiate, puis deux nouvelles tentatives.
+Si le décalage persiste, il conserve `a_reprendre` pour une reprise manuelle.
+Les erreurs réseau restent marquées `erreur`, sans nouvelle tentative automatique.
+Le délai s'applique après l'acquittement du POST, sans garder SQLite ouvert.
 
 Pour relire l'événement **2** de notre demande **105**, depuis vm-signature après
 installation de cette version :

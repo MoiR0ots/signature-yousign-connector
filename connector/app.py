@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import sqlite3
+import time
 from pathlib import Path
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException
@@ -144,8 +145,20 @@ def consulter_evenement(identifiant_evenement):
         if evenement["status"] != "pending":
             resultat = {"etat": "ignoree", "motif": "Notification autre que pending"}
         else:
-            demande = lire_demande(evenement["signRequestId"])
-            resultat = analyser_demande(demande, evenement)
+            # Trois lectures au maximum : immédiatement, puis après 5 secondes
+            # entre chaque tentative. Aucune connexion SQLite ne reste ouverte.
+            for tentative in range(1, 4):
+                demande = lire_demande(evenement["signRequestId"])
+                resultat = analyser_demande(demande, evenement)
+                if resultat["etat"] != "a_reprendre":
+                    break
+                if tentative < 3:
+                    time.sleep(5)
+            # Si ESUP reste en retard, conserver a_reprendre pour une reprise
+            # manuelle. Une demande dépassée ou terminée n'est pas réessayée.
+            # TODO avant production : reprendre automatiquement les événements
+            # bloqués et les signaler (voir le début du README). Pour l'instant,
+            # a_reprendre ne déclenche rien, même après un redémarrage du service.
     except Exception as erreur:
         # Cette frontière protège la réception des erreurs réseau ou d'un format
         # ESUP inattendu. Le type d'erreur est conservé sans exposer la réponse API.
@@ -204,5 +217,5 @@ if __name__ == "__main__":
     options = arguments.parse_args()
     resultat = consulter_evenement(options.evenement)
     print(json.dumps(resultat, ensure_ascii=False, indent=2))
-    if resultat["etat"] == "erreur":
+    if resultat["etat"] in ("erreur", "a_reprendre"):
         raise SystemExit(1)

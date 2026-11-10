@@ -94,3 +94,41 @@ def test_post_consulte_esup_et_doublon_retente(tmp_path, monkeypatch):
         assert connexion.execute("SELECT state FROM events").fetchone()[0] == "derniere_etape"
     finally:
         connexion.close()
+
+
+def test_api_en_retard_puis_a_jour(tmp_path, monkeypatch):
+    """Retenter après un brouillon et une étape ancienne, puis garder le résultat."""
+    monkeypatch.setattr(connecteur, "CHEMIN_BASE", tmp_path / "events.sqlite3")
+    attentes = []
+    monkeypatch.setattr(connecteur.time, "sleep", attentes.append)
+    brouillon = construire_demande()
+    brouillon["status"] = "draft"
+    ancienne = construire_demande()
+    circuit = ancienne["parentSignBook"]["liveWorkflow"]
+    circuit["currentStep"] = circuit["liveWorkflowSteps"][0]
+    reponses = iter([brouillon, ancienne, construire_demande()])
+    monkeypatch.setattr(connecteur, "lire_demande", lambda identifiant: next(reponses))
+    evenement = {"signRequestId": "105", "status": "pending", "step": "2"}
+    reception = connecteur.enregistrer_evenement(evenement)
+    assert connecteur.consulter_evenement(reception["event_id"])["etat"] == "derniere_etape"
+    assert attentes == [5, 5]
+
+
+def test_decalage_persistant_reste_a_reprendre(tmp_path, monkeypatch):
+    """Après trois lectures trop anciennes, ne pas classer l'événement ignoré."""
+    monkeypatch.setattr(connecteur, "CHEMIN_BASE", tmp_path / "events.sqlite3")
+    attentes = []
+    monkeypatch.setattr(connecteur.time, "sleep", attentes.append)
+    demande = construire_demande()
+    demande["status"] = "draft"
+    monkeypatch.setattr(connecteur, "lire_demande", lambda identifiant: demande)
+    reception = connecteur.enregistrer_evenement(
+        {"signRequestId": "105", "status": "pending", "step": "2"}
+    )
+    assert connecteur.consulter_evenement(reception["event_id"])["etat"] == "a_reprendre"
+    assert attentes == [5, 5]
+    connexion = sqlite3.connect(connecteur.CHEMIN_BASE)
+    try:
+        assert connexion.execute("SELECT state FROM events").fetchone()[0] == "a_reprendre"
+    finally:
+        connexion.close()

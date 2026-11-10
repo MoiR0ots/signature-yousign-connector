@@ -22,8 +22,11 @@ def analyser_demande(demande, evenement):
     """Comparer les étapes réelles, puis extraire uniquement la dernière."""
     if str(demande["id"]) != evenement["signRequestId"]:
         raise ValueError("La réponse ESUP ne correspond pas à la demande")
+    if demande["status"] in ("completed", "exported", "refused", "deleted", "archived", "cleaned"):
+        return {"etat": "ignoree", "motif": "La demande est terminée ou refusée"}
     if demande["status"] != "pending":
-        return {"etat": "ignoree", "motif": "La demande n'est plus en attente"}
+        # ESUP peut notifier avant que sa transaction soit visible par l'API.
+        return {"etat": "a_reprendre", "motif": "L'API n'annonce pas encore pending"}
 
     circuit = demande["parentSignBook"]["liveWorkflow"]
     etapes = circuit["liveWorkflowSteps"]
@@ -40,7 +43,10 @@ def analyser_demande(demande, evenement):
             break
     if numero_courant is None:
         raise ValueError("L'étape courante est absente du circuit")
-    if str(numero_courant) != evenement["step"]:
+    numero_annonce = int(evenement["step"])
+    if numero_courant < numero_annonce:
+        return {"etat": "a_reprendre", "motif": "L'API annonce encore une étape antérieure"}
+    if numero_courant > numero_annonce:
         return {"etat": "ignoree", "motif": "La notification concerne une autre étape"}
     if courante["id"] != etapes[-1]["id"]:
         return {"etat": "ignoree", "motif": "Étape intermédiaire"}
