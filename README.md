@@ -52,10 +52,8 @@ Les variables sont regroupées et commentées dans `../playbooks/svc-signature-y
 | Variable | Valeur par défaut / rôle |
 | --- | --- |
 | `connecteur_hotes` | `vm-signature.envdev.test`, cible de l'inventaire Ansible. |
-| `connecteur_source` | `local` pour copier le code depuis envdev, ou `git`. |
-| `connecteur_source_locale` | Racine de ce projet sur la machine qui lance Ansible. |
-| `connecteur_depot_git` | URL du futur dépôt Gitea, à renseigner en mode `git`. |
-| `connecteur_version_git` | Branche, tag ou commit à installer ; `main` par défaut. |
+| `connecteur_depot_git` | `git@bonsai.localsi:pszczolk/signature-yousign-connector.git`, source unique du code. |
+| `connecteur_version_git` | Branche, tag ou commit à installer ; `HEAD` suit par défaut la branche principale du dépôt. |
 | `connecteur_destination` | `/opt/youSignConnector`, contenant `app/` et `venv/`. |
 | `connecteur_donnees` | `/var/lib/yousign-connector`, contenant la base `events.sqlite3`. |
 | `connecteur_utilisateur` | `yousign-connector`, compte système qui exécute le programme. |
@@ -79,14 +77,6 @@ Puis le passer au playbook :
 ```bash
 aonsible run dev playbook /home/vagrant/playbooks/svc-signature-yousignconnector/installer.yml \
   -e @/home/vagrant/connecteur-dev.yml
-```
-
-Quand le dépôt Gitea sera disponible, ajouter à ce fichier (URL fictive à remplacer) :
-
-```yaml
-connecteur_source: git
-connecteur_depot_git: https://gitea.exemple.fr/equipe/youSignConnector.git
-connecteur_version_git: main
 ```
 
 Le téléchargement Git se fait depuis la VM cible avec le compte root utilisé par
