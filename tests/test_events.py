@@ -12,6 +12,7 @@ def test_post_repete_represente_le_meme_evenement(tmp_path, monkeypatch):
     chemin_base = tmp_path / "test.sqlite3"
     # Remplacer le chemin uniquement pendant ce test, sans toucher à la vraie base.
     monkeypatch.setattr(connecteur, "CHEMIN_BASE", chemin_base)
+    monkeypatch.delenv("ESUP_URL", raising=False)
     client = TestClient(connecteur.app)
     donnees = {"signRequestId": "34", "status": "pending", "step": "2"}
 
@@ -52,6 +53,7 @@ def test_post_repete_represente_le_meme_evenement(tmp_path, monkeypatch):
 def test_changement_etape_cree_un_autre_evenement(tmp_path, monkeypatch):
     """Passer de l'étape 1 à l'étape 2 donne deux événements distincts."""
     monkeypatch.setattr(connecteur, "CHEMIN_BASE", tmp_path / "test.sqlite3")
+    monkeypatch.delenv("ESUP_URL", raising=False)
     client = TestClient(connecteur.app)
 
     reponse_etape_1 = client.post(
@@ -72,6 +74,7 @@ def test_notification_incomplete_est_refusee(tmp_path, monkeypatch):
     """Sans identifiant de demande, il n'y a rien à enregistrer."""
     chemin_base = tmp_path / "test.sqlite3"
     monkeypatch.setattr(connecteur, "CHEMIN_BASE", chemin_base)
+    monkeypatch.delenv("ESUP_URL", raising=False)
     client = TestClient(connecteur.app)
 
     reponse = client.post("/esup/events", json={"status": "pending", "step": "2"})

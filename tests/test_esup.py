@@ -1,0 +1,96 @@
+"""Vérifier la règle métier avec un circuit fictif, sans serveur ESUP."""
+
+import sqlite3
+from urllib.error import URLError
+
+from connector import app as connecteur
+from connector.esup import analyser_demande
+
+
+def construire_demande():
+    """Deux étapes, dont la dernière comporte un destinataire externe fictif."""
+    derniere = {
+        "id": 40,
+        "allSignToComplete": True,
+        "recipients": [{
+            "id": 41, "signed": False,
+            "user": {"firstname": "Test", "email": "test@example.org", "userType": "external"},
+        }],
+        "signRequestParams": [{"recipientId": 41, "signPageNumber": 1, "xPos": 216}],
+    }
+    return {
+        "id": 105, "status": "pending",
+        "parentSignBook": {"liveWorkflow": {
+            "currentStep": derniere,
+            "liveWorkflowSteps": [{"id": 38}, derniere],
+        }},
+    }
+
+
+def test_derniere_etape_et_verificateur_ajoute():
+    demande = construire_demande()
+    evenement = {"signRequestId": "105", "status": "pending", "step": "2"}
+    resultat = analyser_demande(demande, evenement)
+    assert resultat["etat"] == "derniere_etape"
+    assert resultat["signataires"][0]["emplacements"][0]["x"] == 216
+
+    # Ajouter un vérificateur change le numéro, pas l'identité de la dernière étape.
+    circuit = demande["parentSignBook"]["liveWorkflow"]
+    circuit["liveWorkflowSteps"].insert(1, {"id": 39})
+    assert analyser_demande(demande, evenement)["etat"] == "ignoree"
+    evenement["step"] = "3"
+    assert analyser_demande(demande, evenement)["id_etape"] == 40
+
+    circuit["currentStep"] = circuit["liveWorkflowSteps"][1]
+    evenement["step"] = "2"
+    assert analyser_demande(demande, evenement)["motif"] == "Étape intermédiaire"
+
+    demande["status"] = "completed"
+    assert analyser_demande(demande, evenement)["etat"] == "ignoree"
+
+
+def test_erreur_puis_reprise_sans_perdre_evenement(tmp_path, monkeypatch):
+    monkeypatch.setattr(connecteur, "CHEMIN_BASE", tmp_path / "events.sqlite3")
+    evenement = {"signRequestId": "105", "status": "pending", "step": "2"}
+    reception = connecteur.enregistrer_evenement(evenement)
+
+    def serveur_indisponible(identifiant):
+        raise URLError("Indisponible")
+
+    monkeypatch.setattr(connecteur, "lire_demande", serveur_indisponible)
+    assert connecteur.consulter_evenement(reception["event_id"])["etat"] == "erreur"
+    monkeypatch.setattr(connecteur, "lire_demande", lambda identifiant: construire_demande())
+    assert connecteur.consulter_evenement(reception["event_id"])["etat"] == "derniere_etape"
+    connexion = sqlite3.connect(connecteur.CHEMIN_BASE)
+    try:
+        assert connexion.execute("SELECT count(*) FROM events").fetchone()[0] == 1
+        assert connexion.execute("SELECT state FROM events").fetchone()[0] == "derniere_etape"
+        assert connexion.execute("SELECT count(*) FROM observations").fetchone()[0] == 1
+    finally:
+        connexion.close()
+
+
+def test_post_consulte_esup_et_doublon_retente(tmp_path, monkeypatch):
+    """La réception reste acquittée si ESUP échoue ; le doublon permet une reprise."""
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setattr(connecteur, "CHEMIN_BASE", tmp_path / "events.sqlite3")
+    monkeypatch.setenv("ESUP_URL", "http://esup.test")
+
+    def serveur_indisponible(identifiant):
+        raise URLError("Indisponible")
+
+    monkeypatch.setattr(connecteur, "lire_demande", serveur_indisponible)
+    client = TestClient(connecteur.app)
+    evenement = {"signRequestId": "105", "status": "pending", "step": "2"}
+    premiere = client.post("/esup/events", json=evenement)
+    assert premiere.status_code == 200
+    monkeypatch.setattr(connecteur, "lire_demande", lambda identifiant: construire_demande())
+    seconde = client.post("/esup/events", json=evenement)
+    assert seconde.status_code == 200
+    assert seconde.json()["duplicate"] is True
+    connexion = sqlite3.connect(connecteur.CHEMIN_BASE)
+    try:
+        assert connexion.execute("SELECT state FROM events").fetchone()[0] == "derniere_etape"
+    finally:
+        connexion.close()

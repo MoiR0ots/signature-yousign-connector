@@ -1,11 +1,13 @@
 # Connecteur ESUP / Yousign — première version
 
 Le programme reçoit les notifications ESUP et les garde dans un fichier SQLite.
+Il consulte le circuit ESUP lorsque `ESUP_URL` est configurée.
 Il ne contacte pas encore Yousign et ne modifie aucun parapheur ESUP.
 
 ## Lire le code
 
-Tout le programme est dans `connector/app.py`. Les fonctions se lisent dans cet ordre :
+La réception et le stockage sont dans `connector/app.py`.
+La consultation et la lecture du circuit sont dans `connector/esup.py`. Les fonctions se lisent dans cet ordre :
 
 1. `initialiser_base` crée la table si nécessaire.
 2. `preparer_evenement` récupère les cinq informations envoyées par ESUP.
@@ -131,8 +133,8 @@ Une erreur SQLite renvoie HTTP 503 au lieu de confirmer un enregistrement échou
 ## Les cinq données envoyées par ESUP
 
 Ces données arrivent dans le corps JSON du POST envoyé par ESUP à notre route
-`/esup/events`. À ce stade, le connecteur reçoit une notification : il ne va pas
-encore interroger l'API ESUP pour récupérer le document ou les signataires.
+`/esup/events`. À ce stade, le connecteur reçoit une notification : il consulte ensuite l’API ESUP si `ESUP_URL` est configurée.
+Le document PDF n’est pas encore téléchargé.
 
 | Champ | Signification | Utilité pour le POC |
 | --- | --- | --- |
@@ -166,7 +168,7 @@ devront être récupérés séparément via l'API ESUP.
 
 ## Ce que conserve SQLite
 
-Une seule table `events` contient :
+La table `events` contient :
 
 - `id` : l'identifiant de l'événement dans le connecteur ;
 - `payload` : les cinq champs ESUP sous forme de JSON, avec une contrainte `UNIQUE` ;
@@ -191,10 +193,65 @@ vérifier l'étape et le document concernés avant de créer une demande de sign
 .venv/bin/python -m pytest -q
 ```
 
-Trois tests : les POST répétés donnent un même événement conservé sur disque
-(et le GET est refusé sans écriture), une autre
-étape donne un nouvel événement, une notification incomplète est refusée.
+Les tests de réception vérifient les doublons, le refus du GET, le changement
+d’étape et le refus des notifications incomplètes.
 Les tests utilisent une base temporaire et ne contactent jamais ESUP.
+Les tests de consultation couvrent aussi la dernière étape, l’ajout d’un
+vérificateur, une notification ancienne et la reprise après une erreur réseau.
 
 Le service reste destiné à une écoute locale sur `127.0.0.1`. L'accès par Apache
 sera préparé lors du déploiement. La base peut contenir des identités et commentaires.
+
+
+## Observer la dernière étape dans ESUP
+
+La variable `ESUP_URL` indique la racine de l'application ESUP, sans `/ws`.
+Le playbook la configure via `connecteur_esup_url`, par défaut
+`http://127.0.0.1:8080`. ESUP doit autoriser l'adresse du connecteur à consulter
+son API. Ce premier jet utilise cet accès par IP, sans authentification par jeton.
+Sans `ESUP_URL`, le programme conserve son fonctionnement de réception seule.
+
+Après avoir enregistré et acquitté une notification, le connecteur consulte ESUP
+pour les événements `pending`. Il compare l'identifiant de l'étape courante à
+celui de la dernière étape de la liste réelle du parapheur. Il vérifie aussi que
+la demande est encore en attente et que le numéro notifié correspond à l'étape
+actuelle. Aucun nombre d'étapes n'est fixé dans la configuration.
+
+Les événements proviennent des circuits auxquels la destination du connecteur
+est associée dans ESUP. Il n'y a pas encore de liste supplémentaire de circuits
+autorisés dans le connecteur.
+
+Le résultat est conservé dans une table `observations` (une observation par
+événement, remplacée à chaque consultation). Le champ `events.state` devient :
+
+- `ignoree` : statut autre que pending, demande terminée, notification ancienne
+  ou étape intermédiaire ;
+- `derniere_etape` : dernière étape identifiée, avec ses destinataires et leurs
+  emplacements ESUP bruts ; cela ne signifie pas encore « prêt pour Yousign » ;
+- `erreur` : consultation impossible ou réponse inexploitable, avec le type d'erreur.
+
+Le journal affiche seulement les identifiants et le résultat. Les identités et
+placements sont dans SQLite. Les coordonnées ne sont pas encore converties pour
+Yousign ; aucun PDF n'est téléchargé, aucune demande n'est envoyée ou clôturée.
+
+La consultation se fait après la réponse HTTP, dans le même processus. Ce n'est
+pas une file de travail persistante : un arrêt du service peut laisser un événement
+`received`. Il n'y a pas de relance automatique pour le moment. Une notification
+doublonnée déclenche une nouvelle lecture, sans créer un nouvel événement.
+Si ESUP n'a pas encore finalisé sa transaction, une relecture peut être nécessaire.
+
+Pour relire l'événement **2** de notre demande **105**, depuis vm-signature après
+installation de cette version :
+
+```bash
+cd /opt/youSignConnector/app
+sudo -u yousign-connector env \
+  CONNECTOR_DB=/var/lib/yousign-connector/events.sqlite3 \
+  ESUP_URL=http://127.0.0.1:8080 \
+  /opt/youSignConnector/venv/bin/python -m connector.app 2
+```
+
+Adapter les chemins si les variables de déploiement ont été changées.
+Cette commande relit l'état actuel d'ESUP et imprime l'observation ; elle ne
+modifie pas le parapheur. Elle fonctionne aussi pour les événements enregistrés
+avant cette évolution. La table `observations` est créée sans effacer `events`.
