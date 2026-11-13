@@ -3,8 +3,9 @@
 import pytest
 import json
 import sqlite3
+import hashlib
 from pathlib import Path
-from connector import yousign, donnees, traitement
+from connector import yousign, donnees, traitement, esup
 
 
 def creer_observation(tmp_path, monkeypatch):
@@ -28,15 +29,38 @@ def creer_observation(tmp_path, monkeypatch):
         }],
     }
     monkeypatch.setattr(traitement, "consulter_evenement", lambda identifiant: observation)
+    contexte = {"signRequestId": 203, "expectedStepId": 209, "contextHash": "a" * 64,
+                "sourceDocumentId": 204, "sourceSha256": hashlib.sha256(pdf.read_bytes()).hexdigest()}
+    monkeypatch.setattr(esup, "lire_contexte_retour", lambda identifiant: dict(contexte))
+    derniere = {
+        "id": 209, "allSignToComplete": True, "signType": "signature",
+        "recipients": [{"id": 210, "signed": False, "user": {
+            "firstname": "Test", "name": "Exemple", "email": "test@example.org", "userType": "external"}}],
+        "signRequestParams": [{"recipientId": 210, "signPageNumber": 1, "signDocumentNumber": 0,
+                               "xPos": 37, "yPos": 691, "signWidth": 100, "signHeight": 50,
+                               "rotate": 0, "allPages": False}],
+    }
+    demande = {"id": 203, "status": "pending", "parentSignBook": {"liveWorkflow": {
+        "currentStep": derniere, "liveWorkflowSteps": [{"id": 207}, derniere]}}}
+    monkeypatch.setattr(esup, "lire_demande", lambda identifiant: demande)
+    monkeypatch.setattr(esup, "envoyer_document_signe", lambda *arguments: {
+        "signRequestId": 203, "documentId": 300, "status": "completed",
+        "signBookStatus": "completed", "duplicate": False,
+    })
     return reception["event_id"], observation
 
 
 def test_brouillon_et_relance_sans_double_creation(tmp_path, monkeypatch):
     evenement, observation = creer_observation(tmp_path, monkeypatch)
     appels = []
+    base = donnees
 
     def repondre(methode, chemin, donnees=None, fichier=None):
         appels.append((methode, chemin, donnees))
+        if methode == "POST" and chemin == "/signature_requests":
+            # La sauvegarde doit précéder même le tout premier POST Yousign.
+            historique = json.loads(base.lister_brouillons()[0][2])
+            assert historique['contexte_esup']['expectedStepId'] == 209
         if chemin.endswith("/documents"):
             return {"id": "document-test"}
         if chemin.endswith("/signers"):
@@ -130,6 +154,7 @@ def test_activation_email_et_recuperation_apres_signature(tmp_path, monkeypatch)
     connexion = sqlite3.connect(donnees.CHEMIN_BASE)
     suivi = {'demande_id': 'demande-test', 'document_id': 'document-test',
              'signataires': {'210': 'signataire-test'}, 'pret': True, 'en_cours': ''}
+    suivi['contexte_esup'] = esup.lire_contexte_retour('203')
     connexion.execute('INSERT INTO brouillons_yousign VALUES (?, ?, ?)',
                       ('203', '209', json.dumps(suivi)))
     connexion.commit()
@@ -224,6 +249,7 @@ def test_cycle_automatique_jusqu_au_pdf_signe(tmp_path, monkeypatch):
         assert connexion.execute('SELECT state FROM events').fetchone()[0] == 'transmis_yousign'
         suivi = json.loads(connexion.execute('SELECT suivi FROM brouillons_yousign').fetchone()[0])
         assert suivi['statut_yousign'] == 'done'
+        assert suivi['retour_esup']['documentId'] == 300
     finally:
         connexion.close()
 
@@ -273,3 +299,62 @@ def test_historique_sans_marqueur_reste_sandbox(tmp_path, monkeypatch):
     monkeypatch.setattr(yousign, 'ADRESSE_API', 'https://api.yousign.app/v3')
     with pytest.raises(ValueError, match='nouveau dossier de données'):
         donnees.verifier_environnement(yousign.ADRESSE_API)
+
+
+def test_pdf_modifie_refuse_avant_envoi(tmp_path, monkeypatch):
+    """Le PDF local doit être celui qu'ESUP associe au contexte initial."""
+    evenement, observation = creer_observation(tmp_path, monkeypatch)
+    Path(observation['document_pdf']).write_bytes(b'%PDF-1.7\nautre version\n%%EOF')
+    with pytest.raises(ValueError, match='PDF ESUP a changé'):
+        traitement.preparer_brouillon(evenement)
+    assert donnees.lister_brouillons() == []
+
+
+def test_retour_repris_apres_perte_de_reponse(tmp_path, monkeypatch):
+    """ESUP a importé le PDF, mais sa réponse au premier POST a été perdue."""
+    creer_observation(tmp_path, monkeypatch)
+    contexte = esup.lire_contexte_retour('203')
+    suivi = {'demande_id': 'demande-test', 'document_id': 'document-test',
+             'signataires': {}, 'pret': True, 'en_cours': '', 'automatique': True,
+             'contexte_esup': contexte}
+    connexion = sqlite3.connect(donnees.CHEMIN_BASE)
+    connexion.execute('INSERT INTO brouillons_yousign VALUES (?, ?, ?)',
+                      ('203', '209', json.dumps(suivi)))
+    connexion.commit()
+    connexion.close()
+    monkeypatch.setattr(yousign, 'lire_demande', lambda identifiant: {'status': 'done'})
+    telechargements = []
+
+    def telecharger(demande, document, destination):
+        telechargements.append(destination)
+        destination.parent.mkdir(parents=True)
+        destination.write_bytes(b'%PDF-1.7\nsigne\n%%EOF')
+
+    envois = []
+
+    def importer(demande, contexte_initial, reference, document):
+        envois.append((demande, contexte_initial, reference, Path(document).read_bytes()))
+        if len(envois) == 1:
+            raise TimeoutError('Réponse perdue après import')
+        return {'signRequestId': 203, 'documentId': 301, 'status': 'completed',
+                'signBookStatus': 'pending', 'duplicate': True}
+
+    monkeypatch.setattr(yousign, 'telecharger_pdf_signe', telecharger)
+    monkeypatch.setattr(esup, 'envoyer_document_signe', importer)
+    # Aucun nouveau contexte ne doit être demandé au retour.
+    monkeypatch.setattr(esup, 'lire_contexte_retour', lambda identifiant: pytest.fail('Relecture du contexte'))
+    traitement.suivre_demandes()
+    traitement.suivre_demandes()
+    traitement.suivre_demandes()
+    assert len(envois) == 2
+    assert envois[0] == envois[1]
+    assert len(telechargements) == 1
+    resultat = json.loads(donnees.lister_brouillons()[0][2])
+    assert resultat['retour_esup']['duplicate'] is True
+
+    # Un ancien essai ne reçoit pas silencieusement un contexte après signature.
+    resultat.pop('contexte_esup')
+    resultat.pop('retour_esup')
+    with pytest.raises(ValueError, match='Contexte ESUP initial absent'):
+        traitement.actualiser_demande('203', '209', resultat)
+    assert len(envois) == 2

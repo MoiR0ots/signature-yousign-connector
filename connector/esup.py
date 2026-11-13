@@ -1,9 +1,10 @@
-"""Client ESUP : lire une demande et télécharger son document courant."""
+"""Client ESUP : lire les demandes et réintégrer les documents signés."""
 
 import json
 import os
 import shutil
 import tempfile
+import uuid
 from pathlib import Path
 from urllib.parse import quote
 from urllib.request import Request, urlopen
@@ -15,7 +16,11 @@ def lire_demande(identifiant):
     if not adresse:
         raise ValueError("ESUP_URL n'est pas configurée")
     url = adresse + "/ws/signrequests/" + quote(str(identifiant), safe="")
-    requete = Request(url, headers={"Accept": "application/json"})
+    entetes = {"Accept": "application/json"}
+    jeton = os.environ.get("ESUP_API_KEY", "").strip()
+    if jeton:
+        entetes["x-api-key"] = jeton
+    requete = Request(url, headers=entetes)
     # Un délai évite de laisser une consultation attendre indéfiniment.
     with urlopen(requete, timeout=10) as reponse:
         return json.load(reponse)
@@ -33,7 +38,11 @@ def telecharger_document(identifiant_demande, identifiant_etape, dossier_documen
     dossier.mkdir(parents=True, exist_ok=True, mode=0o700)
     destination = dossier / "document.pdf"
     url = adresse + "/ws/signrequests/get-last-file/" + demande
-    requete = Request(url, headers={"Accept": "application/pdf"})
+    entetes = {"Accept": "application/pdf"}
+    jeton = os.environ.get("ESUP_API_KEY", "").strip()
+    if jeton:
+        entetes["x-api-key"] = jeton
+    requete = Request(url, headers=entetes)
     temporaire = None
     try:
         with urlopen(requete, timeout=30) as reponse:
@@ -66,3 +75,47 @@ def telecharger_document(identifiant_demande, identifiant_etape, dossier_documen
     finally:
         if temporaire is not None:
             temporaire.unlink(missing_ok=True)
+
+
+def lire_contexte_retour(identifiant):
+    """Lire le contexte à conserver avant l'envoi d'un PDF au prestataire."""
+    adresse = os.environ.get("ESUP_URL", "").rstrip("/")
+    jeton = os.environ.get("ESUP_API_KEY", "").strip()
+    if not adresse or not jeton:
+        raise ValueError("ESUP_URL et ESUP_API_KEY sont nécessaires pour lire le contexte de retour")
+    url = adresse + "/ws/signrequests/" + quote(str(identifiant), safe="") + "/external-completion/context"
+    requete = Request(url, headers={"Accept": "application/json", "x-api-key": jeton})
+    with urlopen(requete, timeout=10) as reponse:
+        return json.load(reponse)
+
+
+def envoyer_document_signe(identifiant, contexte, reference, document):
+    """Ajouter le PDF final comme version signée et valider la dernière étape."""
+    adresse = os.environ.get("ESUP_URL", "").rstrip("/")
+    jeton = os.environ.get("ESUP_API_KEY", "").strip()
+    if not adresse or not jeton:
+        raise ValueError("ESUP_URL et ESUP_API_KEY sont nécessaires pour le retour du PDF")
+
+    # L'API attend un formulaire multipart : trois champs texte et le PDF.
+    # Seule la frontière du formulaire change en cas de nouvel essai ; le PDF,
+    # le contexte initial et la référence métier restent identiques.
+    frontiere = "esup-" + uuid.uuid4().hex
+    morceaux = []
+    champs = {"expectedStepId": contexte["expectedStepId"],
+              "contextHash": contexte["contextHash"], "reference": reference}
+    for nom, valeur in champs.items():
+        morceaux.append(("--" + frontiere + "\r\n"
+                         'Content-Disposition: form-data; name="' + nom + '"\r\n\r\n'
+                         + str(valeur) + "\r\n").encode())
+    morceaux.append(("--" + frontiere + "\r\n"
+                     'Content-Disposition: form-data; name="file"; filename="document-yousign.pdf"\r\n'
+                     "Content-Type: application/pdf\r\n\r\n").encode())
+    morceaux.append(Path(document).read_bytes())
+    morceaux.append(("\r\n--" + frontiere + "--\r\n").encode())
+    url = adresse + "/ws/signrequests/" + quote(str(identifiant), safe="") + "/external-completion"
+    requete = Request(url, data=b"".join(morceaux), method="POST", headers={
+        "Accept": "application/json", "x-api-key": jeton,
+        "Content-Type": "multipart/form-data; boundary=" + frontiere,
+    })
+    with urlopen(requete, timeout=30) as reponse:
+        return json.load(reponse)
