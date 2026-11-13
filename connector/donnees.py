@@ -40,10 +40,22 @@ def initialiser_base():
                 observed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        connexion.execute("""
+            CREATE TABLE IF NOT EXISTS brouillons_yousign (
+                demande TEXT NOT NULL, etape TEXT NOT NULL, suivi TEXT NOT NULL,
+                PRIMARY KEY (demande, etape)
+            )
+        """)
+        connexion.execute("""
+            CREATE TABLE IF NOT EXISTS configuration_yousign (
+                id INTEGER PRIMARY KEY, api_url TEXT NOT NULL
+            )
+        """)
         connexion.commit()
     finally:
         # finally est exécuté même lorsqu'une erreur interrompt le bloc try.
         connexion.close()
+
 
 def enregistrer_evenement(evenement):
     """Enregistrer un événement nouveau ou retrouver celui qui existe déjà."""
@@ -89,6 +101,7 @@ def enregistrer_evenement(evenement):
         "duplicate": doublon,
     }
 
+
 def lire_evenement(identifiant):
     """Lire une notification déjà enregistrée."""
     connexion = sqlite3.connect(CHEMIN_BASE, timeout=10)
@@ -100,6 +113,26 @@ def lire_evenement(identifiant):
     finally:
         connexion.close()
 
+
+def lister_evenements():
+    """Lire les événements dans leur ordre de réception, sans décision métier."""
+    connexion = sqlite3.connect(CHEMIN_BASE, timeout=10)
+    try:
+        return connexion.execute("SELECT id, payload, state FROM events ORDER BY id").fetchall()
+    finally:
+        connexion.close()
+
+
+def changer_etat_evenement(identifiant, etat):
+    """Enregistrer la décision prise par le traitement."""
+    connexion = sqlite3.connect(CHEMIN_BASE, timeout=10)
+    try:
+        connexion.execute("UPDATE events SET state=? WHERE id=?", (etat, identifiant))
+        connexion.commit()
+    finally:
+        connexion.close()
+
+
 def enregistrer_observation(identifiant, resultat, etat):
     """Conserver ensemble l'observation et le nouvel état de l'événement."""
     connexion = sqlite3.connect(CHEMIN_BASE, timeout=10)
@@ -108,5 +141,73 @@ def enregistrer_observation(identifiant, resultat, etat):
                           (identifiant, json.dumps(resultat, ensure_ascii=False)))
         connexion.execute("UPDATE events SET state=? WHERE id=?", (etat, identifiant))
         connexion.commit()
+    finally:
+        connexion.close()
+
+
+def verifier_environnement(adresse_api):
+    """Lier la base à une API pour ne pas mélanger Sandbox et production."""
+    connexion = sqlite3.connect(CHEMIN_BASE, timeout=10)
+    try:
+        connexion.execute("BEGIN IMMEDIATE")
+        ligne = connexion.execute("SELECT api_url FROM configuration_yousign WHERE id=1").fetchone()
+        if ligne is None:
+            historique = connexion.execute("SELECT count(*) FROM brouillons_yousign").fetchone()[0]
+            # Les premières versions ne fonctionnaient qu'en Sandbox.
+            adresse = "https://api-sandbox.yousign.app/v3" if historique else adresse_api
+            connexion.execute("INSERT INTO configuration_yousign VALUES (1,?)", (adresse,))
+        else:
+            adresse = ligne[0]
+        connexion.commit()
+        if adresse != adresse_api:
+            raise ValueError("Cette base utilise une autre API Yousign : choisir un nouveau dossier de données")
+    finally:
+        connexion.close()
+
+
+def reserver_brouillon(demande, etape, empreinte, automatique):
+    """Réserver atomiquement une préparation et empêcher un deuxième POST incertain."""
+    connexion = sqlite3.connect(CHEMIN_BASE, timeout=10)
+    try:
+        connexion.execute("BEGIN IMMEDIATE")
+        ligne = connexion.execute("SELECT suivi FROM brouillons_yousign WHERE demande=? AND etape=?",
+                                  (demande, etape)).fetchone()
+        if ligne is None:
+            suivi = {"empreinte": empreinte, "en_cours": "", "demande_id": None,
+                     "document_id": None, "signataires": {}, "pret": False, "automatique": automatique}
+            connexion.execute("INSERT INTO brouillons_yousign VALUES (?,?,?)",
+                              (demande, etape, json.dumps(suivi)))
+        else:
+            suivi = json.loads(ligne[0])
+        if suivi["en_cours"]:
+            raise ValueError("Préparation en cours ou résultat incertain : vérifier Yousign et SQLite avant reprise")
+        if suivi["empreinte"] != empreinte:
+            raise ValueError("Le PDF ou les signataires ont changé : vérifier le brouillon existant")
+        if not suivi["pret"]:
+            suivi["en_cours"] = "creation" if not suivi["demande_id"] else "reprise"
+            connexion.execute("UPDATE brouillons_yousign SET suivi=? WHERE demande=? AND etape=?",
+                              (json.dumps(suivi), demande, etape))
+        connexion.commit()
+        return suivi
+    finally:
+        connexion.close()
+
+
+def sauvegarder_brouillon(demande, etape, suivi):
+    """Valider le suivi après chaque étape de préparation ou de signature."""
+    connexion = sqlite3.connect(CHEMIN_BASE, timeout=10)
+    try:
+        connexion.execute("UPDATE brouillons_yousign SET suivi=? WHERE demande=? AND etape=?",
+                          (json.dumps(suivi, ensure_ascii=False), demande, etape))
+        connexion.commit()
+    finally:
+        connexion.close()
+
+
+def lister_brouillons():
+    """Lire les correspondances ESUP / Yousign conservées sur disque."""
+    connexion = sqlite3.connect(CHEMIN_BASE, timeout=10)
+    try:
+        return connexion.execute("SELECT demande, etape, suivi FROM brouillons_yousign").fetchall()
     finally:
         connexion.close()

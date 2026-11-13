@@ -4,12 +4,14 @@ Ce fichier décrit le parcours. Le SQL reste dans donnees.py et les appels HTTP
 restent dans esup.py et yousign.py.
 """
 
+import fcntl
+import hashlib
 import json
 import logging
 import os
 import time
 from pathlib import Path
-from connector import donnees, esup
+from connector import donnees, esup, yousign
 
 journal = logging.getLogger(__name__)
 
@@ -96,6 +98,7 @@ def analyser_demande(demande, evenement):
         "signataires": signataires,
     }
 
+
 def consulter_evenement(identifiant_evenement):
     """Consulter ou reconsulter un événement enregistré, sans action de signature."""
     evenement = donnees.lire_evenement(identifiant_evenement)
@@ -129,7 +132,12 @@ def consulter_evenement(identifiant_evenement):
         if isinstance(erreur, ValueError):
             resultat["detail"] = str(erreur)
 
-    etat_evenement = resultat["etat"]
+    # Seuls les nouveaux événements traités avec l'automatisation activée
+    # deviennent à envoyer. Les anciens essais restent sur derniere_etape.
+    if resultat["etat"] == "derniere_etape" and os.environ.get("YOUSIGN_AUTOMATIQUE") == "1":
+        etat_evenement = "a_envoyer"
+    else:
+        etat_evenement = resultat["etat"]
     donnees.enregistrer_observation(identifiant_evenement, resultat, etat_evenement)
     # Les noms, adresses et placements restent dans SQLite, pas dans le journal.
     journal.info(
@@ -138,13 +146,188 @@ def consulter_evenement(identifiant_evenement):
     )
     return resultat
 
+
+def preparer_brouillon(identifiant_evenement, observation=None):
+    """Organiser la préparation, en sauvegardant chaque identifiant obtenu."""
+    yousign.verifier_configuration()
+    donnees.verifier_environnement(yousign.ADRESSE_API)
+    if observation is None:
+        observation = consulter_evenement(identifiant_evenement)
+    if observation["etat"] != "derniere_etape":
+        raise ValueError("La demande n'est pas disponible à sa dernière étape")
+    notification = donnees.lire_evenement(identifiant_evenement)
+    demande = notification["signRequestId"]
+    etape = str(observation["id_etape"])
+    if observation["type_signature"] != "signature" or not observation["toutes_signatures_requises"]:
+        raise ValueError("Le POC nécessite une étape de signature avec tous les signataires requis")
+    signataires = yousign.preparer_signataires(observation)
+    pdf = Path(observation["document_pdf"])
+    empreinte = hashlib.sha256(pdf.read_bytes() + json.dumps(signataires, sort_keys=True).encode()).hexdigest()
+    suivi = donnees.reserver_brouillon(demande, etape, empreinte, os.environ.get("YOUSIGN_AUTOMATIQUE") == "1")
+    if suivi["pret"]:
+        return suivi
+    if not suivi["demande_id"]:
+        reponse = yousign.creer_demande(demande, etape)
+        suivi["demande_id"] = reponse["id"]
+        donnees.sauvegarder_brouillon(demande, etape, suivi)
+    if not suivi["document_id"]:
+        suivi["en_cours"] = "document"
+        donnees.sauvegarder_brouillon(demande, etape, suivi)
+        reponse = yousign.ajouter_document(suivi["demande_id"], pdf)
+        suivi["document_id"] = reponse["id"]
+        donnees.sauvegarder_brouillon(demande, etape, suivi)
+    for personne in signataires:
+        cle = str(personne["id_esup"])
+        if cle in suivi["signataires"]:
+            continue
+        suivi["en_cours"] = "signataire_" + cle
+        donnees.sauvegarder_brouillon(demande, etape, suivi)
+        reponse = yousign.ajouter_signataire(suivi["demande_id"], suivi["document_id"], personne)
+        suivi["signataires"][cle] = reponse["id"]
+        donnees.sauvegarder_brouillon(demande, etape, suivi)
+    if yousign.lire_demande(suivi["demande_id"])["status"] != "draft":
+        raise ValueError("La demande Yousign n'est pas en brouillon")
+    suivi["pret"] = True
+    suivi["en_cours"] = ""
+    donnees.sauvegarder_brouillon(demande, etape, suivi)
+    return suivi
+
+
+def actualiser_demande(demande, etape, suivi):
+    """Activer un brouillon prêt, puis récupérer son résultat lorsqu'il est terminé."""
+    reponse = yousign.lire_demande(suivi["demande_id"])
+    # Une activation déjà faite n'est jamais répétée, même après redémarrage.
+    if reponse["status"] == "draft":
+        if suivi.get("activation_bloquee"):
+            return suivi
+        livraison = os.environ.get("YOUSIGN_LIVRAISON", "none")
+        if livraison not in ("email", "none"):
+            raise ValueError("YOUSIGN_LIVRAISON doit valoir email ou none")
+        try:
+            # Ce réglage s'applique seulement avant l'activation. Il ne renvoie
+            # pas d'invitation pour les demandes déjà en cours ou terminées.
+            reponse = yousign.activer_demande(suivi["demande_id"])
+        except Exception as erreur:
+            # Un refus Sandbox ou un résultat incertain doit être vérifié avant
+            # une nouvelle activation. Le cycle suivant relira tout de même GET.
+            suivi["activation_bloquee"] = True
+            suivi["erreur"] = str(erreur)
+            donnees.sauvegarder_brouillon(demande, etape, suivi)
+            raise
+        suivi["livraison"] = livraison
+    suivi["statut_yousign"] = reponse["status"]
+    suivi["active_le"] = reponse.get("activated_at")
+    if reponse["status"] != "draft":
+        suivi.pop("activation_bloquee", None)
+        suivi.pop("erreur", None)
+    donnees.sauvegarder_brouillon(demande, etape, suivi)
+
+    if reponse["status"] == "ongoing" and not suivi.get("liens_signature"):
+        # Les liens restent privés dans SQLite. Ils servent si la livraison est
+        # none ; avec email, Yousign envoie les invitations aux destinataires.
+        liens = {}
+        for destinataire, identifiant in suivi["signataires"].items():
+            personne = yousign.lire_signataire(suivi["demande_id"], identifiant)
+            liens[destinataire] = personne.get("signature_link")
+        suivi["liens_signature"] = liens
+    elif reponse["status"] == "done":
+        suivi.pop("liens_signature", None)
+        destination = donnees.CHEMIN_BASE.parent / "documents" / demande / etape / "document-yousign.pdf"
+        if not suivi.get("document_signe") or not destination.exists():
+            yousign.telecharger_pdf_signe(suivi["demande_id"], suivi["document_id"], destination)
+            suivi["document_signe"] = str(destination)
+        suivi["termine_le"] = reponse.get("completed_at")
+    donnees.sauvegarder_brouillon(demande, etape, suivi)
+    return suivi
+
+
+def executer_cycle():
+    """Préparer les nouvelles demandes puis suivre les signatures déjà envoyées."""
+    if os.environ.get("YOUSIGN_AUTOMATIQUE") != "1":
+        raise ValueError("Le traitement automatique n'est pas activé")
+    yousign.verifier_configuration()
+    # Une seule initialisation pour l'ensemble des demandes de ce passage.
+    donnees.initialiser_base()
+    donnees.verifier_environnement(yousign.ADRESSE_API)
+    # Le timer ne superpose pas ses exécutions. Ce verrou protège aussi contre
+    # un lancement manuel simultané de cette même commande.
+    verrou = open(donnees.CHEMIN_BASE.parent / "traitement.lock", "a")
+    try:
+        try:
+            fcntl.flock(verrou, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            journal.info("Un traitement est déjà en cours")
+            return
+        traiter_evenements()
+        suivre_demandes()
+    finally:
+        verrou.close()
+
+
+def traiter_evenements():
+    """Relire les notifications en attente, sans rejouer les anciennes étapes."""
+    lignes = donnees.lister_evenements()
+    # Une demande peut avoir plusieurs notifications : seule la dernière reçue
+    # sert de point de départ. L'API ESUP reste la source de son état courant.
+    derniers = {}
+    for identifiant, texte, etat in lignes:
+        evenement = json.loads(texte)
+        derniers[evenement["signRequestId"]] = (identifiant, etat)
+    for identifiant, etat in derniers.values():
+        if etat not in ("received", "a_reprendre", "erreur", "a_envoyer"):
+            continue
+        try:
+            observation = consulter_evenement(identifiant)
+            if observation["etat"] != "derniere_etape":
+                continue
+            preparer_brouillon(identifiant, observation)
+            nouvel_etat = "transmis_yousign"
+            journal.info("Événement %s : brouillon prêt", identifiant)
+        except Exception as erreur:
+            # Pas de POST répété aveuglément : le suivi garde la dernière phase
+            # et bloque une création incertaine pour vérification manuelle.
+            nouvel_etat = "erreur_yousign"
+            journal.error("Événement %s : %s", identifiant, erreur)
+        donnees.changer_etat_evenement(identifiant, nouvel_etat)
+
+
+def suivre_demandes():
+    """Suivre les demandes automatiques, sans réactiver les anciens essais."""
+    for demande, etape, texte in donnees.lister_brouillons():
+        suivi = json.loads(texte)
+        if not suivi.get("automatique") or not suivi["pret"] or suivi["en_cours"]:
+            continue
+        if suivi.get("statut_yousign") == "done" and suivi.get("document_signe"):
+            if Path(suivi["document_signe"]).exists():
+                continue
+        if suivi.get("statut_yousign") in ("canceled", "expired", "declined", "deleted", "rejected"):
+            continue
+        try:
+            ancien_statut = suivi.get("statut_yousign")
+            actualiser_demande(demande, etape, suivi)
+            if suivi.get("statut_yousign") != ancien_statut:
+                journal.info("Demande ESUP %s : Yousign %s", demande, suivi.get("statut_yousign"))
+        except Exception as erreur:
+            journal.error("Demande ESUP %s : %s", demande, erreur)
+
+
 if __name__ == "__main__":
     import argparse
 
-    arguments = argparse.ArgumentParser(description="Consulter un événement ESUP enregistré")
-    arguments.add_argument("evenement", type=int)
+    arguments = argparse.ArgumentParser(description="Traiter les demandes ESUP / Yousign")
+    arguments.add_argument("action", choices=["cycle", "consulter", "preparer"], nargs="?", default="cycle")
+    arguments.add_argument("evenement", type=int, nargs="?")
     options = arguments.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
-    donnees.initialiser_base()
-    resultat = consulter_evenement(options.evenement)
-    print(json.dumps(resultat, ensure_ascii=False, indent=2))
+    if options.action == "cycle":
+        executer_cycle()
+    else:
+        if options.evenement is None:
+            arguments.error("Préciser l'identifiant de l'événement")
+        # Les fonctions de traitement utilisent ensuite les tables existantes.
+        donnees.initialiser_base()
+        if options.action == "consulter":
+            resultat = consulter_evenement(options.evenement)
+        else:
+            resultat = preparer_brouillon(options.evenement)
+        print(json.dumps(resultat, ensure_ascii=False, indent=2))
