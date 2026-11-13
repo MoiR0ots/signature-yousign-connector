@@ -1,45 +1,196 @@
-# Connecteur ESUP / Yousign — première version
+# Connecteur ESUP / Yousign
 
-## À régler avant la mise en production : reprise des événements
+Le connecteur reçoit les notifications des circuits ESUP configurés pour lui.
+Il envoie uniquement leur **dernière étape** à Yousign, avec le PDF contenant les
+signatures internes précédentes, puis récupère le document une fois signé.
+La réintégration du PDF final et la clôture du parapheur ESUP restent à développer.
 
-**La reprise automatique n'est pas encore implémentée.** Après trois consultations
-espacées de 5 secondes, un décalage persistant avec ESUP laisse l'événement en
-`a_reprendre`. Cet état ne déclenche aucun traitement supplémentaire : sans reprise
-manuelle ou nouvelle notification identique, la demande reste bloquée indéfiniment
-côté connecteur. Un redémarrage du service ne la reprend pas non plus.
+## Organisation du code
 
-Avant la production, il reste à :
+| Fichier | Responsabilité |
+| --- | --- |
+| `connector/app.py` | Recevoir les POST, valider les cinq champs, enregistrer la notification et répondre. Aucun appel aux API. |
+| `connector/donnees.py` | Créer et utiliser SQLite. Toutes les requêtes SQL sont ici ; aucun appel réseau. |
+| `connector/esup.py` | Lire une demande et télécharger son PDF via l'API ESUP. Aucun accès SQLite ni décision d'envoi. |
+| `connector/yousign.py` | Construire les requêtes Yousign : brouillon, document, signataires, activation, statut et téléchargement. Aucun accès SQLite. |
+| `connector/traitement.py` | Organiser le parcours, décider si l'étape est la dernière, gérer les reprises et enregistrer la progression. |
+| `connector/__init__.py` | Déclarer le paquet Python ; aucune logique applicative. |
 
-- reprendre automatiquement les événements `a_reprendre`, ainsi que les `erreur`
-  et les `received` laissés sans traitement après un arrêt ;
-- signaler les événements durablement bloqués pour qu'ils ne passent pas inaperçus ;
-- vérifier par un test qu'un événement est repris après une indisponibilité ESUP
-  et après un redémarrage du connecteur.
+Pour comprendre le déroulement métier, lire `traitement.py`. Les noms Python sont
+en français ; les clés JSON ESUP/Yousign gardent leurs noms officiels.
+La réception HTTP et le traitement périodique sont deux programmes distincts.
+Les tables sont initialisées au début de chaque réception, de chaque cycle ou
+de chaque commande de diagnostic, puis utilisées sans initialisation répétée
+à chaque lecture ou écriture.
 
-Ce point reste ouvert même si les essais du POC passent grâce aux trois tentatives.
+## Déroulement
 
-Le programme reçoit les notifications ESUP et les garde dans un fichier SQLite.
-Il consulte le circuit ESUP lorsque `ESUP_URL` est configurée.
-Il ne contacte pas encore Yousign et ne modifie aucun parapheur ESUP.
+1. ESUP envoie un POST à `http://127.0.0.1:8001/esup/events`. `app.py` valide le
+   contenu, l'enregistre par `donnees.py` et répond HTTP 200 après le commit.
+   Un doublon retrouve le même événement, sans modifier son état.
+2. Au prochain passage, `traitement.py` lit la dernière notification de chaque
+   demande à traiter et consulte ESUP avec `esup.py`.
+3. Il vérifie que la demande est `pending`, que l'étape annoncée correspond à
+   l'étape réelle et que cette étape est la dernière de la liste ordonnée du circuit.
+   Aucun nombre d'étapes n'est imposé : des vérificateurs peuvent être ajoutés avant.
+4. Si l'API semble en retard, il effectue trois lectures maximum espacées de cinq
+   secondes. Un décalage persistant reste `a_reprendre` pour le prochain passage.
+5. Pour la dernière étape, il récupère les destinataires, leurs placements et le PDF
+   courant. Les comptes ESUP internes (`ldap`) et externes sont acceptés.
+6. Il prépare un unique brouillon Yousign par demande et étape, en mémorisant chaque
+   identifiant obtenu, puis active la demande. Avec `email`, Yousign envoie les
+   invitations ; le connecteur n'utilise pas le SMTP ESUP.
+7. Les passages suivants consultent le statut. En `done`, le PDF signé est conservé
+   séparément du PDF d'origine. Une erreur de téléchargement sera retentée.
 
-## Lire le code
+Le timer systemd déclenche un passage après la fin du précédent. Un verrou empêche
+également deux passages manuels simultanés. Aucun traitement API n'est exécuté
+pendant la réception du POST.
 
-La réception et le stockage sont dans `connector/app.py`.
-La consultation et la lecture du circuit sont dans `connector/esup.py`. Les fonctions se lisent dans cet ordre :
+## Les cinq données envoyées par ESUP
 
-1. `initialiser_base` crée la table si nécessaire.
-2. `preparer_evenement` récupère les cinq informations envoyées par ESUP.
-3. `enregistrer_evenement` retrouve ou crée l'événement.
-4. Les deux routes à la fin du fichier répondent aux appels HTTP.
+Ces informations arrivent dans le JSON du POST. Ce ne sont pas les informations
+complètes du circuit : le traitement doit ensuite consulter l'API ESUP.
 
-`try/finally` permet de fermer une connexion SQLite même si une erreur survient.
-`commit()` valide les écritures ; `rollback()` les annule en cas d'erreur.
-Les `?` dans les requêtes SQL sont remplacés par les valeurs passées séparément.
+| Champ | Signification et usage |
+| --- | --- |
+| `signRequestId` | Identifiant de la demande ESUP (`SignRequest`), par exemple `"243"`. Il permet de consulter l'API. Ce n'est pas l'identifiant du parapheur (`SignBook`) ni celui de l'événement local. |
+| `status` | État ou action au moment de l'émission : `pending`, `completed`, `refused`, `deleted`, `cleaned`, `restored`. Le traitement d'envoi s'intéresse à `pending`. |
+| `step` | Numéro d'ordre de l'étape annoncé par ESUP, par exemple `"2"`, ou `"end"` en fin de circuit. Il n'indique pas si l'étape est la dernière et n'est pas son identifiant technique. |
+| `userEppn` | Utilisateur à l'origine de l'action, ou compte technique tel que `scheduler`. Ce n'est pas forcément un signataire ou une adresse mail. |
+| `comment` | Texte associé, par exemple un motif de refus. Il peut être vide. |
 
-Les noms Python sont en français. Les clés envoyées par ESUP gardent leurs noms
-d'origine pour respecter le format de ses notifications.
+```json
+{
+  "signRequestId": "243",
+  "status": "pending",
+  "step": "2",
+  "userEppn": "utilisateur@exemple.fr",
+  "comment": ""
+}
+```
 
-## Lancement depuis envdev
+Les trois premiers champs sont obligatoires ; les deux autres valent une chaîne
+vide lorsqu'ils sont absents. Les champs inconnus sont ignorés. ESUP envoie aussi
+un GET avant le POST : il est refusé avec HTTP 405 et n'écrit rien dans SQLite.
+Le POST réussi suffit à acquitter l'envoi ESUP. `GET /` vérifie simplement que le
+serveur HTTP répond ; il ne vérifie ni SQLite ni les API.
+
+## Données persistantes et reprises
+
+`CONNECTOR_DB` désigne SQLite. Sans cette variable, la base se trouve dans
+`data/events.sqlite3` à la racine du projet.
+
+| Table | Contenu |
+| --- | --- |
+| `events` | Notification JSON unique, identifiant local, état et date UTC de première réception. |
+| `observations` | Dernière analyse ESUP par événement, signataires, placements et chemin du PDF courant. Une nouvelle consultation remplace l'observation. |
+| `brouillons_yousign` | Suivi unique par demande ESUP et étape : empreinte des paramètres/PDF, identifiants Yousign, phase en cours, statut, liens privés et chemin du PDF signé. |
+| `configuration_yousign` | URL API liée à cette base, pour éviter de mélanger Sandbox et production. |
+
+Les états d'événement principaux sont : `received`, `ignoree`, `a_reprendre`,
+`erreur`, `a_envoyer`, `transmis_yousign` et `erreur_yousign`. Une consultation
+manuelle sans automatisation conserve `derniere_etape` au lieu de `a_envoyer`.
+
+Le traitement reprend automatiquement `received`, `a_reprendre` et `erreur`.
+Il ne réactive pas une demande déjà en cours, ni un ancien brouillon créé
+manuellement. Une demande terminée dont le PDF existe n'est plus interrogée.
+Les états de refus, annulation et expiration ne produisent pas un document présenté
+comme entièrement signé.
+
+**À compléter avant production :** une création au résultat incertain conserve
+`en_cours` et bloque les nouveaux POST pour éviter les doublons. Une activation
+refusée conserve `activation_bloquee` et son erreur. Ces cas nécessitent encore
+une vérification manuelle des ressources distantes avant reprise. Il reste à
+prévoir leur réconciliation et une alerte en dehors des logs.
+
+Une modification ESUP avant création est prise en compte par la relecture du
+parapheur. Une modification après préparation Yousign n'est pas synchronisée :
+le changement d'empreinte bloque la réutilisation silencieuse du brouillon.
+
+## PDF et emplacements
+
+Les fichiers sont conservés à côté de la base :
+
+```text
+documents/<id_demande>/<id_etape>/document.pdf         # PDF courant ESUP
+documents/<id_demande>/<id_etape>/document-yousign.pdf # résultat Yousign
+```
+
+Le téléchargement se fait dans un fichier temporaire privé, renommé une fois
+terminé. Le début `%PDF-`, la fin `%%EOF` et la longueur annoncée si disponible
+sont contrôlés. Ce n'est pas une validation cryptographique des signatures.
+Un échec préserve un éventuel ancien PDF. Les fichiers ne sont pas purgés automatiquement.
+
+Les coordonnées partent du coin supérieur gauche dans les deux systèmes.
+Le POC suppose `fixFactor=1` côté ESUP, une échelle de signature de 1, un PDF sans
+rotation, le document 0 et des placements explicites sans option toutes-pages ni
+champ PDF préexistant. Les cas complexes sont refusés. Un emplacement générique
+sans destinataire est accepté seulement si l'étape contient une seule personne.
+Le rendu Yousign reste à valider visuellement, notamment le ratio des signatures.
+Les essais utilisent une signature simple (`electronic_signature`) sans OTP (`no_otp`).
+
+## Installation par Ansible
+
+Le déploiement est dans `../playbooks/svc-signature-yousignconnector/` :
+`installer.yml`, `tasks/`, `templates/`, `variables.yml` et `inventaire/`.
+Il crée le compte système, l'environnement Python, le service HTTP et le timer,
+sans modifier ESUP ni Apache. Le connecteur reste sur la même VM qu'ESUP.
+
+```bash
+aonsible run dev playbook ~/playbooks/svc-signature-yousignconnector/installer.yml
+```
+
+Le playbook récupère les sources depuis
+`git@bonsai.localsi:pszczolk/signature-yousign-connector.git`.
+L'accès Git SSH de root doit être configuré sur la cible. `connecteur_version_git`
+permet de choisir une branche, un tag ou un commit (`HEAD` par défaut).
+
+| Variable | Rôle / valeur par défaut |
+| --- | --- |
+| `connecteur_hotes` | Cible Ansible : `vm-signature.envdev.test`. |
+| `connecteur_destination` | Code et environnement Python : `/opt/youSignConnector`. |
+| `connecteur_donnees` | Données persistantes : `/var/lib/yousign-connector`. |
+| `connecteur_utilisateur` / `connecteur_service` | Compte et service : `yousign-connector`. |
+| `connecteur_adresse` / `connecteur_port` | Écoute HTTP : `127.0.0.1` / `8001`. |
+| `connecteur_esup_url` | API ESUP locale : `http://127.0.0.1:8080`. L'accès par IP doit être autorisé côté ESUP. |
+| `connecteur_yousign_api_url` | URL API avec `/v3`, Sandbox par défaut. |
+| `connecteur_yousign_automatique` | Active le traitement et son timer. |
+| `connecteur_yousign_intervalle` | Intervalle en secondes après la fin d'un passage. 120 dans notre inventaire Sandbox pour limiter les appels. |
+| `connecteur_yousign_livraison` | `email` envoie les invitations ; `none` conserve les liens dans SQLite. |
+| `connecteur_fichier_secrets` | Fichier privé généré : `/etc/yousign-connector/secrets.env`. |
+| `connecteur_environnement_installation` | Proxy éventuel pour apt, pip et Git. |
+| `connecteur_yousign_proxy` | Proxy HTTPS éventuel du traitement vers Yousign. |
+
+`variables.yml` fournit les valeurs générales. `inventaire/signature-dev_main.yml`
+les complète pour notre VM, avec une seule valeur Vault : `connecteur_yousign_api_key`.
+Le mot de passe Vault reste hors du dépôt. Pour chiffrer une nouvelle valeur sans
+mettre la clé dans l'historique du terminal :
+
+```bash
+ansible-vault encrypt_string --stdin-name connecteur_yousign_api_key
+```
+
+Le template `secrets.env.j2` écrit `YOUSIGN_API_KEY` dans un fichier root `0600`,
+dans un dossier `0700`. La tâche utilise `no_log: true` et `diff: false`.
+Il n'est pas nécessaire de créer ce fichier à la main. Le traitement le charge
+au prochain passage. Le service HTTP ne reçoit pas la clé.
+
+Pour une autre VM, préparer un fichier de configuration et le sélectionner :
+
+```bash
+aonsible run dev playbook ~/playbooks/svc-signature-yousignconnector/installer.yml \
+  -e connecteur_inventaire=inventaire/signature-prod_main.yml
+```
+
+Adapter aussi l'inventaire aonsible `dev` si nécessaire.
+Les API officielles sont `https://api-sandbox.yousign.app/v3` et
+`https://api.yousign.app/v3`. Chaque environnement nécessite sa propre clé.
+Pour passer de Sandbox en production, choisir également un nouveau dossier de
+données : la base refuse de changer d'API. L'ancien historique du POC est considéré
+comme Sandbox s'il contient déjà des demandes Yousign.
+
+## Lancement local et commandes de diagnostic
 
 ```bash
 cd /home/vagrant/youSignConnector
@@ -48,255 +199,38 @@ python3 -m venv .venv
 .venv/bin/uvicorn connector.app:app --host 127.0.0.1 --port 8001 --no-access-log
 ```
 
-FastAPI gère les routes et la lecture du JSON. Uvicorn est le serveur HTTP.
-Nous n'utilisons plus directement Starlette dans le code.
-
-La base est créée au premier événement, dans `data/events.sqlite3`.
-On peut choisir un autre fichier avec la variable d'environnement `CONNECTOR_DB`.
-Le déploiement sur une VM est décrit ci-dessous.
-
-## Installer sur vm-signature
-
-Le playbook `../playbooks/svc-signature-yousignconnector/installer.yml` installe le connecteur comme un service autonome.
-Il ne modifie ni ESUP-Signature ni Apache. Il installe Python, crée un compte système
-et un environnement Python dédié, puis active le service `yousign-connector`.
-
-Depuis envdev :
+Pour consulter un événement ou préparer un brouillon seul, configurer les variables
+appropriées puis lancer :
 
 ```bash
-aonsible run dev playbook /home/vagrant/playbooks/svc-signature-yousignconnector/installer.yml
+.venv/bin/python -m connector.traitement consulter 10
+.venv/bin/python -m connector.traitement preparer 10
 ```
 
-Les variables sont regroupées et commentées dans `../playbooks/svc-signature-yousignconnector/variables.yml` :
-
-| Variable | Valeur par défaut / rôle |
-| --- | --- |
-| `connecteur_hotes` | `vm-signature.envdev.test`, cible de l'inventaire Ansible. |
-| `connecteur_depot_git` | `git@bonsai.localsi:pszczolk/signature-yousign-connector.git`, source unique du code. |
-| `connecteur_version_git` | Branche, tag ou commit à installer ; `HEAD` suit par défaut la branche principale du dépôt. |
-| `connecteur_destination` | `/opt/youSignConnector`, contenant `app/` et `venv/`. |
-| `connecteur_donnees` | `/var/lib/yousign-connector`, contenant la base `events.sqlite3`. |
-| `connecteur_utilisateur` | `yousign-connector`, compte système qui exécute le programme. |
-| `connecteur_service` | `yousign-connector`, nom du service systemd. |
-| `connecteur_adresse` / `connecteur_port` | `127.0.0.1` / `8001`, écoute locale par défaut. |
-| `connecteur_environnement_installation` | Variables de proxy pour apt, pip et Git si nécessaire. |
-
-Pour adapter l'installation, créer un fichier de variables, par exemple
-`/home/vagrant/connecteur-dev.yml` :
-
-```yaml
-connecteur_destination: /opt/youSignConnector
-connecteur_environnement_installation:
-  http_proxy: http://vm-proxy-envdev.envdev.test:3128
-  https_proxy: http://vm-proxy-envdev.envdev.test:3128
-  no_proxy: localhost,127.0.0.1,.envdev.test
-```
-
-Puis le passer au playbook :
+`consulter` nécessite `ESUP_URL` et `CONNECTOR_DB` ; `preparer` nécessite aussi
+`YOUSIGN_API_KEY` et l'URL API choisie dans `YOUSIGN_API_URL`.
+L'action `preparer` n'active pas à elle seule le brouillon.
+Le cycle complet se lance avec `python -m connector.traitement cycle` et
+`YOUSIGN_AUTOMATIQUE=1`. Sur la VM, systemd fournit ces variables et lit le secret.
 
 ```bash
-aonsible run dev playbook /home/vagrant/playbooks/svc-signature-yousignconnector/installer.yml \
-  -e @/home/vagrant/connecteur-dev.yml
+sudo systemctl start yousign-connector-traitement.service
+sudo journalctl -u yousign-connector-traitement.service -n 50 --no-pager
+sudo systemctl status yousign-connector-traitement.timer --no-pager
 ```
 
-Le téléchargement Git se fait depuis la VM cible avec le compte root utilisé par
-Ansible. Pour un dépôt privé, son accès doit être configuré au préalable ; ne pas
-mettre de mot de passe dans l'URL du dépôt. Pour passer d'une installation locale
-à Git, choisir une nouvelle `connecteur_destination` : Git ne peut pas cloner dans
-le dossier `app/` déjà rempli par la copie locale. Garder `connecteur_donnees`
-inchangé permet de conserver la base. Changer ce chemin ne migre pas les données.
-
-Relancer le playbook met à jour le code et redémarre le service si nécessaire.
-La base est créée à la première notification et n'est pas remplacée par le playbook.
-La vérification finale appelle seulement `GET /` ; elle ne crée aucun événement.
-
-Sur la VM cible, pour vérifier le service et consulter ses messages :
-
-```bash
-sudo systemctl status yousign-connector --no-pager
-sudo journalctl -u yousign-connector -n 50 --no-pager
-curl http://127.0.0.1:8001/
-```
-
-ESUP, installé sur la même VM, pourra envoyer ses notifications à
-`http://127.0.0.1:8001/esup/events`. La configuration de cette cible dans ESUP reste
-une étape distincte. Le connecteur peut aussi être installé sur une autre VM en
-adaptant la cible Ansible et son adresse d'écoute.
-
-## Essayer les routes
-
-`GET /` confirme simplement que le programme répond. Il ne vérifie pas le stockage.
-
-ESUP envoie un GET puis un POST pour une même notification. Le connecteur
-accepte uniquement le POST. FastAPI refuse automatiquement le GET avec HTTP 405.
-ESUP peut journaliser ce refus, mais poursuit avec le POST. L'envoi est considéré
-réussi si le POST répond HTTP 200.
-
-Pour envoyer une notification :
-
-```bash
-curl http://127.0.0.1:8001/esup/events \
-  -H 'Content-Type: application/json' \
-  -d '{"signRequestId":"34","status":"pending","step":"2"}'
-```
-
-Les champs `signRequestId`, `status` et `step` sont obligatoires.
-`userEppn` et `comment` valent une chaîne vide lorsqu'ils sont absents.
-Les autres champs sont ignorés dans cette version.
-
-Le premier POST retourne `duplicate: false`. Un POST identique retourne
-`duplicate: true` avec le même `event_id`. Les deux répondent HTTP 200.
-Une erreur SQLite renvoie HTTP 503 au lieu de confirmer un enregistrement échoué.
-
-## Les cinq données envoyées par ESUP
-
-Ces données arrivent dans le corps JSON du POST envoyé par ESUP à notre route
-`/esup/events`. À ce stade, le connecteur reçoit une notification : il consulte ensuite l’API ESUP si `ESUP_URL` est configurée.
-Le PDF courant est téléchargé uniquement si la dernière étape est identifiée.
-
-| Champ | Signification | Utilité pour le POC |
-| --- | --- | --- |
-| `signRequestId` | Identifiant de la demande de signature ESUP (`SignRequest`), par exemple `"34"`. Ce n'est ni l'identifiant du parapheur (`SignBook`), ni celui de l'événement enregistré dans notre base. | Retrouver la demande dans l'API ESUP pour récupérer ses informations et son PDF. |
-| `status` | État ou action signalé au moment de l'envoi, par exemple `"pending"` (en attente), `"completed"` (terminé) ou `"refused"` (refusé). ESUP peut aussi envoyer `"deleted"`, `"cleaned"` et `"restored"` pour une suppression, un nettoyage ou une restauration. | Décider si l'événement nécessite un traitement. Une notification `pending` pourra déclencher la vérification de l'étape avant un éventuel envoi à Yousign. |
-| `step` | Numéro de l'étape courante, par exemple `"2"`. ESUP utilise aussi `"end"` lors de l'envoi de fin de circuit. Ce numéro n'est pas l'identifiant technique de l'étape dans l'API. | Repérer l'avancement du circuit. Il faudra consulter ESUP pour connaître les destinataires et les paramètres de cette étape. |
-| `userEppn` | Identifiant de l'utilisateur à l'origine de l'action. Il peut aussi désigner un traitement automatique, par exemple `"scheduler"`. Ce n'est pas nécessairement un signataire ni une adresse mail. | Comprendre l'origine de l'événement. Ce champ ne suffit pas à déterminer à qui envoyer une invitation Yousign. |
-| `comment` | Texte associé à l'action, par exemple un motif de refus. Il peut être vide. | Conserver une explication utile au suivi ou au diagnostic. |
-
-Exemple de notification complète, avec un identifiant utilisateur fictif :
-
-```json
-{
-  "signRequestId": "34",
-  "status": "pending",
-  "step": "2",
-  "userEppn": "utilisateur@exemple.fr",
-  "comment": ""
-}
-```
-
-ESUP envoie ces cinq valeurs sous forme de chaînes de caractères. Notre connecteur
-exige les trois premières et accepte l'absence des deux dernières en les remplaçant
-par une chaîne vide.
-
-Ces données décrivent l'événement au moment où il s'est produit. Avant de créer
-une demande Yousign, le connecteur devra relire l'état courant dans ESUP : le
-circuit peut avoir avancé depuis la notification. Le PDF, la liste des signataires
-et les emplacements des signatures ne sont pas inclus dans ces cinq champs ; ils
-devront être récupérés séparément via l'API ESUP.
-
-## Ce que conserve SQLite
-
-La table `events` contient :
-
-- `id` : l'identifiant de l'événement dans le connecteur ;
-- `payload` : les cinq champs ESUP sous forme de JSON, avec une contrainte `UNIQUE` ;
-- `state` : l'état du traitement, initialement `received` (reçu) ;
-- `received_at` : la date UTC de la première réception.
-
-Le JSON est toujours écrit avec les clés triées et sans espaces inutiles.
-Deux notifications identiques donnent donc le même texte. On retrouve directement
-ce texte dans SQLite, sans calculer d'empreinte SHA-256.
-
-Un doublon retourne l'identifiant existant. Il ne change ni la date ni l'état du
-traitement. Les répétitions ne sont plus conservées individuellement.
-La déduplication reste effective après redémarrage grâce au fichier SQLite.
-
-Cela déduplique les notifications reçues. Le futur traitement Yousign devra aussi
-vérifier l'étape et le document concernés avant de créer une demande de signature.
-
-## Vérifications simples
+## Tests et documentation des API
 
 ```bash
 .venv/bin/pip install -r requirements-dev.txt
 .venv/bin/python -m pytest -q
 ```
 
-Les tests de réception vérifient les doublons, le refus du GET, le changement
-d’étape et le refus des notifications incomplètes.
-Les tests utilisent une base temporaire et ne contactent jamais ESUP.
-Les tests de consultation couvrent aussi la dernière étape, l’ajout d’un
-vérificateur, une notification ancienne et la reprise après une erreur réseau.
+Les tests utilisent des bases et fichiers temporaires, avec des réponses API
+fictives. Ils n'envoient ni demande de signature ni mail à de vrais destinataires.
 
-Le service reste destiné à une écoute locale sur `127.0.0.1`. L'accès par Apache
-sera préparé lors du déploiement. La base peut contenir des identités et commentaires.
-
-
-## Observer la dernière étape dans ESUP
-
-La variable `ESUP_URL` indique la racine de l'application ESUP, sans `/ws`.
-Le playbook la configure via `connecteur_esup_url`, par défaut
-`http://127.0.0.1:8080`. ESUP doit autoriser l'adresse du connecteur à consulter
-son API. Ce premier jet utilise cet accès par IP, sans authentification par jeton.
-Sans `ESUP_URL`, le programme conserve son fonctionnement de réception seule.
-
-Après avoir enregistré et acquitté une notification, le connecteur consulte ESUP
-pour les événements `pending`. Il compare l'identifiant de l'étape courante à
-celui de la dernière étape de la liste réelle du parapheur. Il vérifie aussi que
-la demande est encore en attente et que le numéro notifié correspond à l'étape
-actuelle. Aucun nombre d'étapes n'est fixé dans la configuration.
-
-Les événements proviennent des circuits auxquels la destination du connecteur
-est associée dans ESUP. Il n'y a pas encore de liste supplémentaire de circuits
-autorisés dans le connecteur.
-
-Le résultat est conservé dans une table `observations` (une observation par
-événement, remplacée à chaque consultation). Le champ `events.state` devient :
-
-- `ignoree` : statut autre que pending, demande terminée, notification ancienne
-  ou étape intermédiaire ;
-- `derniere_etape` : dernière étape identifiée, avec ses destinataires et leurs
-  emplacements ESUP bruts ; cela ne signifie pas encore « prêt pour Yousign » ;
-- `a_reprendre` : l’API reste en retard après trois consultations ;
-- `erreur` : consultation impossible ou réponse inexploitable, avec le type d'erreur.
-
-Le journal affiche seulement les identifiants et le résultat. Les identités et
-placements sont dans SQLite. Les coordonnées ne sont pas encore converties pour
-Yousign ; le PDF courant est téléchargé, mais aucune demande n’est envoyée ou clôturée.
-
-La consultation se fait après la réponse HTTP, dans le même processus. Ce n'est
-pas une file de travail persistante : un arrêt du service peut laisser un événement
-`received`. Il n’y a pas de relance périodique automatique. Une notification
-doublonnée déclenche une nouvelle lecture, sans créer un nouvel événement.
-Si l’API annonce une étape antérieure ou un statut pas encore `pending` (hors
-statuts terminés ou refusés), le connecteur effectue au maximum trois lectures,
-espacées de **5 secondes** : une lecture immédiate, puis deux nouvelles tentatives.
-Si le décalage persiste, il conserve `a_reprendre` pour une reprise manuelle.
-Les erreurs réseau restent marquées `erreur`, sans nouvelle tentative automatique.
-Le délai s'applique après l'acquittement du POST, sans garder SQLite ouvert.
-
-Pour relire l'événement **2** de notre demande **105**, depuis vm-signature après
-installation de cette version :
-
-```bash
-cd /opt/youSignConnector/app
-sudo -u yousign-connector env \
-  CONNECTOR_DB=/var/lib/yousign-connector/events.sqlite3 \
-  ESUP_URL=http://127.0.0.1:8080 \
-  /opt/youSignConnector/venv/bin/python -m connector.app 2
-```
-
-Adapter les chemins si les variables de déploiement ont été changées.
-Cette commande relit l'état actuel d'ESUP et imprime l'observation ; elle ne
-modifie pas le parapheur. Elle fonctionne aussi pour les événements enregistrés
-avant cette évolution. La table `observations` est créée sans effacer `events`.
-
-
-## PDF de la dernière étape
-
-Après identification de la dernière étape, le connecteur télécharge le PDF courant
-via `GET /ws/signrequests/get-last-file/{id}`. Il le conserve à côté de la base :
-`documents/<id_demande>/<id_etape>/document.pdf`, soit sous
-`/var/lib/yousign-connector/documents/` avec la configuration du playbook.
-Le chemin est enregistré dans `observations.resultat`, champ `document_pdf`.
-Aucune variable supplémentaire ni modification du playbook n'est nécessaire.
-
-Le téléchargement utilise un fichier temporaire privé, renommé une fois terminé.
-Le programme vérifie l'en-tête PDF, sa terminaison et, si fournie par ESUP, la
-longueur annoncée. Ce ne sont pas une validation complète du PDF ni une vérification
-cryptographique des signatures. Une erreur laisse l'événement en `erreur` avec un
-motif ; un éventuel ancien PDF reste intact. La commande de reprise retélécharge
-le document courant et remplace le fichier après vérification.
-
-Le connecteur ne télécharge rien pour les étapes intermédiaires. Il ne transmet
-encore aucun document à Yousign et ne modifie pas ESUP. Les téléchargements déjà
-conservés ne sont pas supprimés automatiquement.
+Documentation officielle : [environnements](https://developers.yousign.com/docs/environments-new),
+[création de demande](https://developers.yousign.com/reference/post-signature_requests-1),
+[dépôt de document](https://developers.yousign.com/reference/post-signature_requests-signaturerequestid-documents-1)
+et [coordonnées des champs](https://developers.yousign.com/docs/field-creation-with-api-endpoints).
+Les domaines de documentation et d'API externes restent ceux publiés par le fournisseur.
