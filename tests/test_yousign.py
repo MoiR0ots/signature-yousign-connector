@@ -73,14 +73,22 @@ def test_brouillon_et_relance_sans_double_creation(tmp_path, monkeypatch):
         return {"id": "demande-test"}
 
     monkeypatch.setattr(yousign, "appeler_api", repondre)
-    resultat = traitement.preparer_brouillon(evenement)
+    resultat = traitement.preparer_brouillon(evenement, observation)
     assert resultat["pret"] is True
     assert len(appels) == 4
-    assert traitement.preparer_brouillon(evenement) == resultat
+    assert traitement.preparer_brouillon(evenement, observation) == resultat
     assert len(appels) == 4
+    # Le contexte conservé suffit à refuser une préparation différente,
+    # sans calculer une deuxième empreinte locale du PDF et des signataires.
+    contexte_modifie = dict(resultat["contexte_esup"], contextHash="b" * 64)
+    monkeypatch.setattr(esup, "lire_contexte_retour", lambda identifiant: contexte_modifie)
+    with pytest.raises(ValueError, match="contexte ESUP a changé"):
+        traitement.preparer_brouillon(evenement, observation)
+    assert len(appels) == 4
+    monkeypatch.setattr(esup, "lire_contexte_retour", lambda identifiant: resultat["contexte_esup"])
     observation["signataires"][0]["email"] = "autre@example.org"
     with pytest.raises(ValueError, match="ont changé"):
-        traitement.preparer_brouillon(evenement)
+        traitement.preparer_brouillon(evenement, observation)
 
 
 def test_resultat_incertain_empeche_un_second_post(tmp_path, monkeypatch):
@@ -93,9 +101,9 @@ def test_resultat_incertain_empeche_un_second_post(tmp_path, monkeypatch):
 
     monkeypatch.setattr(yousign, "appeler_api", delai_depasse)
     with pytest.raises(TimeoutError):
-        traitement.preparer_brouillon(evenement)
+        traitement.preparer_brouillon(evenement, observation)
     with pytest.raises(ValueError, match="résultat incertain"):
-        traitement.preparer_brouillon(evenement)
+        traitement.preparer_brouillon(evenement, observation)
     assert len(appels) == 1
 
 
@@ -103,7 +111,7 @@ def test_placement_complexe_refuse_avant_creation(tmp_path, monkeypatch):
     evenement, observation = creer_observation(tmp_path, monkeypatch)
     observation["signataires"][0]["emplacements"][0]["rotation"] = 90
     with pytest.raises(ValueError, match="Placement non pris en charge"):
-        traitement.preparer_brouillon(evenement)
+        traitement.preparer_brouillon(evenement, observation)
 
 
 def test_upload_envoie_le_format_multipart_attendu(tmp_path, monkeypatch):
@@ -268,7 +276,7 @@ def test_pdf_modifie_refuse_avant_envoi(tmp_path, monkeypatch):
     evenement, observation = creer_observation(tmp_path, monkeypatch)
     Path(observation['document_pdf']).write_bytes(b'%PDF-1.7\nautre version\n%%EOF')
     with pytest.raises(ValueError, match='PDF ESUP a changé'):
-        traitement.preparer_brouillon(evenement)
+        traitement.preparer_brouillon(evenement, observation)
     assert donnees.lister_brouillons() == []
 
 

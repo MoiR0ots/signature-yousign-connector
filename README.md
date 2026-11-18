@@ -7,6 +7,9 @@ version dans ESUP et valide la dernière étape. Le parapheur est clôturé lors
 toutes ses demandes sont terminées. Ce retour nécessite l'extension ESUP installée
 par le playbook ; le parcours complet reste à valider sur une nouvelle demande de test.
 
+Une [fiche de présentation du POC](docs/presentation-poc.md) résume le parcours
+et le périmètre de la validation en test.
+
 ## Consigne impérative à communiquer aux métiers
 
 **Dès l'arrivée à la dernière étape, l'envoi à Yousign est automatique. À partir
@@ -116,7 +119,7 @@ serveur HTTP répond ; il ne vérifie ni SQLite ni les API.
 | --- | --- |
 | `events` | Notification JSON unique, identifiant local, état et date UTC de première réception. |
 | `observations` | Dernière analyse ESUP par événement, signataires, placements et chemin du PDF courant. Une nouvelle consultation remplace l'observation. |
-| `brouillons_yousign` | Suivi unique par demande ESUP et étape : empreinte des paramètres/PDF, contexte ESUP initial, identifiants Yousign, phase en cours, statut, liens privés, chemin du PDF signé et confirmation du retour ESUP. |
+| `brouillons_yousign` | Suivi unique par demande ESUP et étape : contexte ESUP initial, identifiants Yousign, phase en cours, statut, liens privés, chemin du PDF signé et confirmation du retour ESUP. |
 | `configuration_yousign` | URL API liée à cette base, pour éviter de mélanger Sandbox et production. |
 
 Les états d'événement principaux sont : `received`, `ignoree`, `a_reprendre`,
@@ -143,9 +146,16 @@ refusée conserve `activation_bloquee` et son erreur. Ces cas nécessitent encor
 une vérification manuelle des ressources distantes avant reprise. Il reste à
 prévoir leur réconciliation et une alerte en dehors des logs.
 
+**Point connu reporté :** une panne pendant la lecture du contexte ESUP, avant
+la création Yousign, classe actuellement l'événement en `erreur_yousign` et ne le
+retente pas automatiquement. Il reste à distinguer ces erreurs avant envoi des
+résultats de POST incertains. Ce comportement n'a pas été modifié par la dernière
+simplification ; consulter les journaux pour repérer une demande bloquée.
+
+
 Une modification ESUP avant création est prise en compte par la relecture du
 parapheur. Une modification après préparation Yousign n'est pas synchronisée :
-le changement d'empreinte bloque la réutilisation silencieuse du brouillon.
+le changement de contexte ESUP bloque la réutilisation silencieuse du brouillon.
 
 ## PDF et emplacements
 
@@ -191,7 +201,7 @@ permet de choisir une branche, un tag ou un commit (`HEAD` par défaut).
 | `connecteur_destination` | Code et environnement Python : `/opt/youSignConnector`. |
 | `connecteur_donnees` | Données persistantes : `/var/lib/yousign-connector`. |
 | `connecteur_utilisateur` / `connecteur_service` | Compte et service : `yousign-connector`. |
-| `connecteur_adresse` / `connecteur_port` | Écoute HTTP : `127.0.0.1` / `8001`. |
+| `connecteur_port` | Port HTTP : `8001`. Écoute fixée à `127.0.0.1`, sur la même VM qu’ESUP. |
 | `connecteur_esup_url` | API ESUP locale : `http://127.0.0.1:8080`. L'accès par IP doit être autorisé côté ESUP. |
 | `connecteur_yousign_api_url` | URL API avec `/v3`, définie dans l’inventaire. |
 | `connecteur_yousign_intervalle` | Intervalle en secondes après la fin d'un passage. 120 dans notre inventaire Sandbox pour limiter les appels. |
@@ -236,18 +246,17 @@ python3 -m venv .venv
 .venv/bin/uvicorn connector.app:app --host 127.0.0.1 --port 8001 --no-access-log
 ```
 
-Pour consulter un événement ou préparer un brouillon seul, configurer les variables
-appropriées puis lancer :
+Pour consulter un événement enregistré, configurer `ESUP_URL`, `ESUP_API_KEY`
+et `CONNECTOR_DB`, puis lancer :
 
 ```bash
 .venv/bin/python -m connector.traitement consulter 10
-.venv/bin/python -m connector.traitement preparer 10
 ```
 
-`consulter` nécessite `ESUP_URL` et `CONNECTOR_DB` ; `preparer` nécessite aussi
-`YOUSIGN_API_KEY`, `ESUP_API_KEY` et l'URL API choisie dans `YOUSIGN_API_URL`.
-L'action `preparer` crée le brouillon ; le traitement périodique l'activera ensuite.
-Ces commandes servent au diagnostic et à la reprise, pas au fonctionnement normal.
+Cette commande ne crée pas de demande Yousign. Elle met à jour l'observation et
+l'état de l'événement dans SQLite ; une dernière étape valide devient `a_envoyer`
+et pourra donc être traitée au prochain passage du timer.
+La préparation du brouillon est réservée au parcours automatique.
 Le cycle complet se lance avec `python -m connector.traitement cycle`.
 Le traitement est toujours automatique ; aucune variable d'activation n'est
 nécessaire. Sur la VM, systemd fournit la configuration et lit les secrets.

@@ -163,7 +163,7 @@ def verifier_environnement(adresse_api):
         connexion.close()
 
 
-def reserver_brouillon(demande, etape, empreinte, contexte):
+def reserver_brouillon(demande, etape, contexte):
     """Réserver atomiquement une préparation et empêcher un deuxième POST incertain."""
     connexion = sqlite3.connect(CHEMIN_BASE, timeout=10)
     try:
@@ -171,7 +171,7 @@ def reserver_brouillon(demande, etape, empreinte, contexte):
         ligne = connexion.execute("SELECT suivi FROM brouillons_yousign WHERE demande=? AND etape=?",
                                   (demande, etape)).fetchone()
         if ligne is None:
-            suivi = {"empreinte": empreinte, "en_cours": "", "demande_id": None,
+            suivi = {"en_cours": "", "demande_id": None,
                      "document_id": None, "signataires": {}, "pret": False,
                      "contexte_esup": contexte}
             connexion.execute("INSERT INTO brouillons_yousign VALUES (?,?,?)",
@@ -180,8 +180,6 @@ def reserver_brouillon(demande, etape, empreinte, contexte):
             suivi = json.loads(ligne[0])
         if suivi["en_cours"]:
             raise ValueError("Préparation en cours ou résultat incertain : vérifier Yousign et SQLite avant reprise")
-        if suivi["empreinte"] != empreinte:
-            raise ValueError("Le PDF ou les signataires ont changé : vérifier le brouillon existant")
         # Ne jamais remplacer le contexte initial par l'état courant d'ESUP.
         if suivi["contexte_esup"] != contexte:
             raise ValueError("Le contexte ESUP a changé : vérifier la demande")

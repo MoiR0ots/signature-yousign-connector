@@ -145,12 +145,8 @@ def consulter_evenement(identifiant_evenement):
     return resultat
 
 
-def preparer_brouillon(identifiant_evenement, observation=None):
+def preparer_brouillon(identifiant_evenement, observation):
     """Organiser la préparation, en sauvegardant chaque identifiant obtenu."""
-    yousign.verifier_configuration()
-    donnees.verifier_environnement(yousign.ADRESSE_API)
-    if observation is None:
-        observation = consulter_evenement(identifiant_evenement)
     if observation["etat"] != "derniere_etape":
         raise ValueError("La demande n'est pas disponible à sa dernière étape")
     notification = donnees.lire_evenement(identifiant_evenement)
@@ -180,10 +176,8 @@ def preparer_brouillon(identifiant_evenement, observation=None):
         raise ValueError("Les signataires ou leurs emplacements ont changé avant l'envoi")
     if esup.lire_contexte_retour(demande) != contexte:
         raise ValueError("Le contexte ESUP a changé pendant la préparation")
-    empreinte = hashlib.sha256(pdf.read_bytes() + json.dumps(signataires, sort_keys=True).encode()).hexdigest()
-    suivi = donnees.reserver_brouillon(
-        demande, etape, empreinte, contexte,
-    )
+    # Le contexte ESUP couvre déjà le PDF, les destinataires et les placements.
+    suivi = donnees.reserver_brouillon(demande, etape, contexte)
     if suivi["pret"]:
         return suivi
     if not suivi["demande_id"]:
@@ -246,15 +240,23 @@ def actualiser_demande(demande, etape, suivi):
             personne = yousign.lire_signataire(suivi["demande_id"], identifiant)
             liens[destinataire] = personne.get("signature_link")
         suivi["liens_signature"] = liens
+        donnees.sauvegarder_brouillon(demande, etape, suivi)
     elif reponse["status"] == "done":
-        suivi.pop("liens_signature", None)
-        destination = donnees.CHEMIN_BASE.parent / "documents" / demande / etape / "document-yousign.pdf"
-        if not suivi.get("document_signe") or not destination.exists():
-            yousign.telecharger_pdf_signe(suivi["demande_id"], suivi["document_id"], destination)
-            suivi["document_signe"] = str(destination)
         suivi["termine_le"] = reponse.get("completed_at")
+        reintegrer_document_signe(demande, etape, suivi)
+    return suivi
+
+
+def reintegrer_document_signe(demande, etape, suivi):
+    """Conserver le PDF final, l'envoyer à ESUP et mémoriser sa confirmation."""
+    suivi.pop("liens_signature", None)
+    destination = donnees.CHEMIN_BASE.parent / "documents" / demande / etape / "document-yousign.pdf"
+    if not suivi.get("document_signe") or not destination.exists():
+        yousign.telecharger_pdf_signe(suivi["demande_id"], suivi["document_id"], destination)
+        suivi["document_signe"] = str(destination)
+    # Enregistrer le fichier avant l'import pour le réutiliser en cas de reprise.
     donnees.sauvegarder_brouillon(demande, etape, suivi)
-    if reponse["status"] == "done" and not suivi.get("retour_esup"):
+    if not suivi.get("retour_esup"):
         contexte = suivi["contexte_esup"]
         if str(contexte["signRequestId"]) != demande or str(contexte["expectedStepId"]) != etape:
             raise ValueError("Le contexte initial ne correspond pas à la demande ESUP")
@@ -270,7 +272,6 @@ def actualiser_demande(demande, etape, suivi):
         suivi["retour_esup"] = confirmation
         donnees.sauvegarder_brouillon(demande, etape, suivi)
         journal.info("Demande ESUP %s : PDF final importé, dernière étape validée", demande)
-    return suivi
 
 
 def executer_cycle():
@@ -345,7 +346,7 @@ if __name__ == "__main__":
     import argparse
 
     arguments = argparse.ArgumentParser(description="Traiter les demandes ESUP / Yousign")
-    arguments.add_argument("action", choices=["cycle", "consulter", "preparer"], nargs="?", default="cycle")
+    arguments.add_argument("action", choices=["cycle", "consulter"], nargs="?", default="cycle")
     arguments.add_argument("evenement", type=int, nargs="?")
     options = arguments.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
@@ -356,8 +357,5 @@ if __name__ == "__main__":
             arguments.error("Préciser l'identifiant de l'événement")
         # Les fonctions de traitement utilisent ensuite les tables existantes.
         donnees.initialiser_base()
-        if options.action == "consulter":
-            resultat = consulter_evenement(options.evenement)
-        else:
-            resultat = preparer_brouillon(options.evenement)
+        resultat = consulter_evenement(options.evenement)
         print(json.dumps(resultat, ensure_ascii=False, indent=2))
