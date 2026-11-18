@@ -69,7 +69,7 @@ def test_brouillon_et_relance_sans_double_creation(tmp_path, monkeypatch):
             return {"id": "signataire-test"}
         if methode == "GET":
             return {"status": "draft"}
-        assert donnees["delivery_mode"] == "none"
+        assert donnees["delivery_mode"] == "email"
         return {"id": "demande-test"}
 
     monkeypatch.setattr(yousign, "appeler_api", repondre)
@@ -138,7 +138,6 @@ def test_signataire_interne_accepte_a_la_derniere_etape(tmp_path, monkeypatch):
 def test_activation_email_et_recuperation_apres_signature(tmp_path, monkeypatch):
     """Activer une seule fois et reprendre le téléchargement après une panne."""
     evenement, observation = creer_observation(tmp_path, monkeypatch)
-    monkeypatch.setenv("YOUSIGN_LIVRAISON", "email")
     appels = []
     etat = {"status": "draft"}
 
@@ -160,7 +159,7 @@ def test_activation_email_et_recuperation_apres_signature(tmp_path, monkeypatch)
     connexion.commit()
     try:
         traitement.actualiser_demande( '203', '209', suivi)
-        assert ('PATCH', '/signature_requests/demande-test', {'delivery_mode': 'email'}) in appels
+        assert all(methode != 'PATCH' for methode, chemin, donnees in appels)
         assert suivi['statut_yousign'] == 'ongoing'
         traitement.actualiser_demande( '203', '209', suivi)
         assert sum(chemin.endswith('/activate') for methode, chemin, donnees in appels) == 1
@@ -210,8 +209,6 @@ def test_cycle_automatique_jusqu_au_pdf_signe(tmp_path, monkeypatch):
     from connector import traitement
 
     evenement, observation = creer_observation(tmp_path, monkeypatch)
-    monkeypatch.setenv('YOUSIGN_AUTOMATIQUE', '1')
-    monkeypatch.setenv('YOUSIGN_LIVRAISON', 'email')
     etat = {'status': 'draft'}
     appels = []
 
@@ -254,28 +251,6 @@ def test_cycle_automatique_jusqu_au_pdf_signe(tmp_path, monkeypatch):
         connexion.close()
 
 
-def test_cycle_ne_rejoue_pas_les_anciens_essais(tmp_path, monkeypatch):
-    from connector import traitement
-
-    evenement, observation = creer_observation(tmp_path, monkeypatch)
-    monkeypatch.setenv('YOUSIGN_AUTOMATIQUE', '1')
-    connexion = sqlite3.connect(donnees.CHEMIN_BASE)
-    try:
-        connexion.execute("UPDATE events SET state='derniere_etape'")
-        connexion.execute('INSERT INTO brouillons_yousign VALUES (?, ?, ?)', (
-            '203', '209', json.dumps({'pret': True, 'en_cours': '', 'demande_id': 'ancien-test'}),
-        ))
-        connexion.commit()
-    finally:
-        connexion.close()
-
-    def aucun_appel(*args, **kwargs):
-        raise AssertionError('Un ancien essai ne doit pas être activé')
-
-    monkeypatch.setattr(yousign, 'appeler_api', aucun_appel)
-    traitement.executer_cycle()
-
-
 def test_changement_api_refuse_sur_une_base_existante(tmp_path, monkeypatch):
     evenement, observation = creer_observation(tmp_path, monkeypatch)
     monkeypatch.setattr(yousign, 'ADRESSE_API', 'https://api-sandbox.yousign.app/v3')
@@ -286,19 +261,6 @@ def test_changement_api_refuse_sur_une_base_existante(tmp_path, monkeypatch):
     monkeypatch.setattr(donnees, 'CHEMIN_BASE', tmp_path / 'prod/events.sqlite3')
     donnees.initialiser_base()
     donnees.verifier_environnement(yousign.ADRESSE_API)
-
-
-def test_historique_sans_marqueur_reste_sandbox(tmp_path, monkeypatch):
-    evenement, observation = creer_observation(tmp_path, monkeypatch)
-    connexion = sqlite3.connect(donnees.CHEMIN_BASE)
-    try:
-        connexion.execute('INSERT INTO brouillons_yousign VALUES (?, ?, ?)', ('203','209','{}'))
-        connexion.commit()
-    finally:
-        connexion.close()
-    monkeypatch.setattr(yousign, 'ADRESSE_API', 'https://api.yousign.app/v3')
-    with pytest.raises(ValueError, match='nouveau dossier de données'):
-        donnees.verifier_environnement(yousign.ADRESSE_API)
 
 
 def test_pdf_modifie_refuse_avant_envoi(tmp_path, monkeypatch):
@@ -315,7 +277,7 @@ def test_retour_repris_apres_perte_de_reponse(tmp_path, monkeypatch):
     creer_observation(tmp_path, monkeypatch)
     contexte = esup.lire_contexte_retour('203')
     suivi = {'demande_id': 'demande-test', 'document_id': 'document-test',
-             'signataires': {}, 'pret': True, 'en_cours': '', 'automatique': True,
+             'signataires': {}, 'pret': True, 'en_cours': '',
              'contexte_esup': contexte}
     connexion = sqlite3.connect(donnees.CHEMIN_BASE)
     connexion.execute('INSERT INTO brouillons_yousign VALUES (?, ?, ?)',
@@ -351,10 +313,3 @@ def test_retour_repris_apres_perte_de_reponse(tmp_path, monkeypatch):
     assert len(telechargements) == 1
     resultat = json.loads(donnees.lister_brouillons()[0][2])
     assert resultat['retour_esup']['duplicate'] is True
-
-    # Un ancien essai ne reçoit pas silencieusement un contexte après signature.
-    resultat.pop('contexte_esup')
-    resultat.pop('retour_esup')
-    with pytest.raises(ValueError, match='Contexte ESUP initial absent'):
-        traitement.actualiser_demande('203', '209', resultat)
-    assert len(envois) == 2

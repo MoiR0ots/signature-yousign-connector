@@ -8,7 +8,6 @@ import fcntl
 import hashlib
 import json
 import logging
-import os
 import time
 from pathlib import Path
 from connector import donnees, esup, yousign
@@ -116,7 +115,7 @@ def consulter_evenement(identifiant_evenement):
                 if tentative < 3:
                     time.sleep(5)
             # Si ESUP reste en retard, le traitement périodique reprendra
-            # a_reprendre lorsqu'il est activé ; sinon la reprise reste manuelle.
+            # les événements a_reprendre au prochain passage.
             # Une demande dépassée ou terminée n'est pas réessayée.
             if resultat["etat"] == "derniere_etape":
                 # Les documents suivent le dossier de la base : aucun chemin
@@ -132,9 +131,8 @@ def consulter_evenement(identifiant_evenement):
         if isinstance(erreur, ValueError):
             resultat["detail"] = str(erreur)
 
-    # Seuls les nouveaux événements traités avec l'automatisation activée
-    # deviennent à envoyer. Les anciens essais restent sur derniere_etape.
-    if resultat["etat"] == "derniere_etape" and os.environ.get("YOUSIGN_AUTOMATIQUE") == "1":
+    # Une dernière étape validée est toujours à envoyer au prochain traitement.
+    if resultat["etat"] == "derniere_etape":
         etat_evenement = "a_envoyer"
     else:
         etat_evenement = resultat["etat"]
@@ -184,7 +182,7 @@ def preparer_brouillon(identifiant_evenement, observation=None):
         raise ValueError("Le contexte ESUP a changé pendant la préparation")
     empreinte = hashlib.sha256(pdf.read_bytes() + json.dumps(signataires, sort_keys=True).encode()).hexdigest()
     suivi = donnees.reserver_brouillon(
-        demande, etape, empreinte, os.environ.get("YOUSIGN_AUTOMATIQUE") == "1", contexte,
+        demande, etape, empreinte, contexte,
     )
     if suivi["pret"]:
         return suivi
@@ -222,12 +220,9 @@ def actualiser_demande(demande, etape, suivi):
     if reponse["status"] == "draft":
         if suivi.get("activation_bloquee"):
             return suivi
-        livraison = os.environ.get("YOUSIGN_LIVRAISON", "none")
-        if livraison not in ("email", "none"):
-            raise ValueError("YOUSIGN_LIVRAISON doit valoir email ou none")
         try:
-            # Ce réglage s'applique seulement avant l'activation. Il ne renvoie
-            # pas d'invitation pour les demandes déjà en cours ou terminées.
+            # La demande a été créée avec livraison par email. Son activation
+            # déclenche les invitations ; une demande ongoing ne repasse pas ici.
             reponse = yousign.activer_demande(suivi["demande_id"])
         except Exception as erreur:
             # Un refus Sandbox ou un résultat incertain doit être vérifié avant
@@ -236,7 +231,6 @@ def actualiser_demande(demande, etape, suivi):
             suivi["erreur"] = str(erreur)
             donnees.sauvegarder_brouillon(demande, etape, suivi)
             raise
-        suivi["livraison"] = livraison
     suivi["statut_yousign"] = reponse["status"]
     suivi["active_le"] = reponse.get("activated_at")
     if reponse["status"] != "draft":
@@ -245,8 +239,8 @@ def actualiser_demande(demande, etape, suivi):
     donnees.sauvegarder_brouillon(demande, etape, suivi)
 
     if reponse["status"] == "ongoing" and not suivi.get("liens_signature"):
-        # Les liens restent privés dans SQLite. Ils servent si la livraison est
-        # none ; avec email, Yousign envoie les invitations aux destinataires.
+        # Les invitations sont envoyées par Yousign. Les liens restent aussi
+        # privés dans SQLite pour le diagnostic en cas de mail non reçu.
         liens = {}
         for destinataire, identifiant in suivi["signataires"].items():
             personne = yousign.lire_signataire(suivi["demande_id"], identifiant)
@@ -261,9 +255,7 @@ def actualiser_demande(demande, etape, suivi):
         suivi["termine_le"] = reponse.get("completed_at")
     donnees.sauvegarder_brouillon(demande, etape, suivi)
     if reponse["status"] == "done" and not suivi.get("retour_esup"):
-        contexte = suivi.get("contexte_esup")
-        if not contexte:
-            raise ValueError("Contexte ESUP initial absent : cet ancien essai nécessite une vérification manuelle")
+        contexte = suivi["contexte_esup"]
         if str(contexte["signRequestId"]) != demande or str(contexte["expectedStepId"]) != etape:
             raise ValueError("Le contexte initial ne correspond pas à la demande ESUP")
         # Le PDF et son chemin sont déjà validés et sauvegardés ci-dessus.
@@ -283,8 +275,6 @@ def actualiser_demande(demande, etape, suivi):
 
 def executer_cycle():
     """Préparer les nouvelles demandes puis suivre les signatures déjà envoyées."""
-    if os.environ.get("YOUSIGN_AUTOMATIQUE") != "1":
-        raise ValueError("Le traitement automatique n'est pas activé")
     yousign.verifier_configuration()
     # Une seule initialisation pour l'ensemble des demandes de ce passage.
     donnees.initialiser_base()
@@ -332,10 +322,10 @@ def traiter_evenements():
 
 
 def suivre_demandes():
-    """Suivre les demandes automatiques, sans réactiver les anciens essais."""
+    """Suivre les demandes prêtes et réintégrer les PDF terminés dans ESUP."""
     for demande, etape, texte in donnees.lister_brouillons():
         suivi = json.loads(texte)
-        if not suivi.get("automatique") or not suivi["pret"] or suivi["en_cours"]:
+        if not suivi["pret"] or suivi["en_cours"]:
             continue
         if suivi.get("statut_yousign") == "done" and suivi.get("retour_esup") and suivi.get("document_signe"):
             if Path(suivi["document_signe"]).exists():

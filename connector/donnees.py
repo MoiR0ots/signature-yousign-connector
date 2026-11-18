@@ -152,9 +152,7 @@ def verifier_environnement(adresse_api):
         connexion.execute("BEGIN IMMEDIATE")
         ligne = connexion.execute("SELECT api_url FROM configuration_yousign WHERE id=1").fetchone()
         if ligne is None:
-            historique = connexion.execute("SELECT count(*) FROM brouillons_yousign").fetchone()[0]
-            # Les premières versions ne fonctionnaient qu'en Sandbox.
-            adresse = "https://api-sandbox.yousign.app/v3" if historique else adresse_api
+            adresse = adresse_api
             connexion.execute("INSERT INTO configuration_yousign VALUES (1,?)", (adresse,))
         else:
             adresse = ligne[0]
@@ -165,7 +163,7 @@ def verifier_environnement(adresse_api):
         connexion.close()
 
 
-def reserver_brouillon(demande, etape, empreinte, automatique, contexte):
+def reserver_brouillon(demande, etape, empreinte, contexte):
     """Réserver atomiquement une préparation et empêcher un deuxième POST incertain."""
     connexion = sqlite3.connect(CHEMIN_BASE, timeout=10)
     try:
@@ -174,7 +172,7 @@ def reserver_brouillon(demande, etape, empreinte, automatique, contexte):
                                   (demande, etape)).fetchone()
         if ligne is None:
             suivi = {"empreinte": empreinte, "en_cours": "", "demande_id": None,
-                     "document_id": None, "signataires": {}, "pret": False, "automatique": automatique,
+                     "document_id": None, "signataires": {}, "pret": False,
                      "contexte_esup": contexte}
             connexion.execute("INSERT INTO brouillons_yousign VALUES (?,?,?)",
                               (demande, etape, json.dumps(suivi)))
@@ -185,9 +183,8 @@ def reserver_brouillon(demande, etape, empreinte, automatique, contexte):
         if suivi["empreinte"] != empreinte:
             raise ValueError("Le PDF ou les signataires ont changé : vérifier le brouillon existant")
         # Ne jamais remplacer le contexte initial par l'état courant d'ESUP.
-        # Les anciens essais sans contexte ne doivent pas être complétés après coup.
-        if suivi.get("contexte_esup") != contexte:
-            raise ValueError("Le contexte ESUP a changé ou manque dans cet ancien essai : vérifier la demande")
+        if suivi["contexte_esup"] != contexte:
+            raise ValueError("Le contexte ESUP a changé : vérifier la demande")
         if not suivi["pret"]:
             suivi["en_cours"] = "creation" if not suivi["demande_id"] else "reprise"
             connexion.execute("UPDATE brouillons_yousign SET suivi=? WHERE demande=? AND etape=?",

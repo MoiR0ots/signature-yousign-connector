@@ -65,7 +65,7 @@ de chaque commande de diagnostic, puis utilisées sans initialisation répétée
 6. Il vérifie la cohérence du PDF et des signataires avec le contexte ESUP, qu'il
    sauvegarde dans SQLite avant tout envoi. Il prépare un unique brouillon Yousign
    par demande et étape, en mémorisant chaque
-   identifiant obtenu, puis active la demande. Avec `email`, Yousign envoie les
+   identifiant obtenu, puis active la demande. Yousign envoie systématiquement les
    invitations ; le connecteur n'utilise pas le SMTP ESUP.
 7. Les passages suivants consultent le statut. En `done`, le PDF signé est conservé
    séparément du PDF d'origine. Une erreur de téléchargement sera retentée.
@@ -120,12 +120,11 @@ serveur HTTP répond ; il ne vérifie ni SQLite ni les API.
 | `configuration_yousign` | URL API liée à cette base, pour éviter de mélanger Sandbox et production. |
 
 Les états d'événement principaux sont : `received`, `ignoree`, `a_reprendre`,
-`erreur`, `a_envoyer`, `transmis_yousign` et `erreur_yousign`. Une consultation
-manuelle sans automatisation conserve `derniere_etape` au lieu de `a_envoyer`.
+`erreur`, `a_envoyer`, `transmis_yousign` et `erreur_yousign`. Une dernière étape
+validée passe toujours à `a_envoyer`.
 
 Le traitement reprend automatiquement `received`, `a_reprendre` et `erreur`.
-Il ne réactive pas une demande déjà en cours, ni un ancien brouillon créé
-manuellement. Une demande terminée n'est plus interrogée lorsque son PDF existe
+Il ne réactive pas une demande déjà en cours. Une demande terminée n'est plus interrogée lorsque son PDF existe
 et que son import ESUP a été confirmé.
 Les états de refus, annulation et expiration ne produisent pas un document présenté
 comme entièrement signé.
@@ -137,10 +136,6 @@ seconde version. Le suivi `retour_esup` conserve cette confirmation, notamment
 l'identifiant du document et le statut du parapheur. Un conflit HTTP 409 signifie
 qu'il faut vérifier manuellement le parapheur : le connecteur ne renouvelle pas
 le contexte pour forcer l'import. Les erreurs restent visibles dans le journal.
-
-Les anciens essais sans `contexte_esup` ne sont pas complétés après coup et ne
-peuvent pas être importés automatiquement. Utiliser une nouvelle demande pour
-tester le parcours complet avec cette version.
 
 **À compléter avant production :** une création au résultat incertain conserve
 `en_cours` et bloque les nouveaux POST pour éviter les doublons. Une activation
@@ -199,9 +194,7 @@ permet de choisir une branche, un tag ou un commit (`HEAD` par défaut).
 | `connecteur_adresse` / `connecteur_port` | Écoute HTTP : `127.0.0.1` / `8001`. |
 | `connecteur_esup_url` | API ESUP locale : `http://127.0.0.1:8080`. L'accès par IP doit être autorisé côté ESUP. |
 | `connecteur_yousign_api_url` | URL API avec `/v3`, définie dans l’inventaire. |
-| `connecteur_yousign_automatique` | Active le traitement et son timer. |
 | `connecteur_yousign_intervalle` | Intervalle en secondes après la fin d'un passage. 120 dans notre inventaire Sandbox pour limiter les appels. |
-| `connecteur_yousign_livraison` | `email` envoie les invitations ; `none` conserve les liens dans SQLite. |
 | `connecteur_fichier_secrets` | Fichier privé généré : `/etc/yousign-connector/secrets.env`. |
 | `connecteur_environnement_installation` | Proxy éventuel pour apt, pip et Git. |
 | `connecteur_yousign_proxy` | Proxy HTTPS éventuel du traitement vers Yousign. |
@@ -232,8 +225,7 @@ Adapter aussi l'inventaire aonsible `dev` si nécessaire.
 Les API officielles sont `https://api-sandbox.yousign.app/v3` et
 `https://api.yousign.app/v3`. Chaque environnement nécessite sa propre clé.
 Pour passer de Sandbox en production, choisir également un nouveau dossier de
-données : la base refuse de changer d'API. L'ancien historique du POC est considéré
-comme Sandbox s'il contient déjà des demandes Yousign.
+données : la base refuse de changer d'API.
 
 ## Lancement local et commandes de diagnostic
 
@@ -254,9 +246,11 @@ appropriées puis lancer :
 
 `consulter` nécessite `ESUP_URL` et `CONNECTOR_DB` ; `preparer` nécessite aussi
 `YOUSIGN_API_KEY`, `ESUP_API_KEY` et l'URL API choisie dans `YOUSIGN_API_URL`.
-L'action `preparer` n'active pas à elle seule le brouillon.
-Le cycle complet se lance avec `python -m connector.traitement cycle` et
-`YOUSIGN_AUTOMATIQUE=1`. Sur la VM, systemd fournit ces variables et lit le secret.
+L'action `preparer` crée le brouillon ; le traitement périodique l'activera ensuite.
+Ces commandes servent au diagnostic et à la reprise, pas au fonctionnement normal.
+Le cycle complet se lance avec `python -m connector.traitement cycle`.
+Le traitement est toujours automatique ; aucune variable d'activation n'est
+nécessaire. Sur la VM, systemd fournit la configuration et lit les secrets.
 
 ```bash
 sudo systemctl start yousign-connector-traitement.service

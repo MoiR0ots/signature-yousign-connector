@@ -18,8 +18,6 @@ def verifier_configuration():
         raise ValueError("YOUSIGN_API_URL doit désigner l'API Sandbox ou production Yousign")
     if not os.environ.get("YOUSIGN_API_KEY"):
         raise ValueError("YOUSIGN_API_KEY n'est pas configurée")
-    if os.environ.get("YOUSIGN_LIVRAISON", "none") not in ("email", "none"):
-        raise ValueError("YOUSIGN_LIVRAISON doit valoir email ou none")
 
 
 def appeler_api(methode, chemin, donnees=None, fichier=None):
@@ -101,7 +99,7 @@ def creer_demande(demande, etape):
     return appeler_api("POST", "/signature_requests", {
         "name": f"ESUP {demande} - étape {etape}",
         "external_id": f"esup-{demande}-etape-{etape}",
-        "delivery_mode": os.environ.get("YOUSIGN_LIVRAISON", "none"),
+        "delivery_mode": "email",
         "ordered_signers": False,
     })
 
@@ -126,7 +124,6 @@ def lire_demande(identifiant):
 
 def activer_demande(identifiant):
     chemin = "/signature_requests/" + identifiant
-    appeler_api("PATCH", chemin, {"delivery_mode": os.environ.get("YOUSIGN_LIVRAISON", "none")})
     return appeler_api("POST", chemin + "/activate", {})
 
 

@@ -77,7 +77,7 @@ def test_erreur_puis_reprise_sans_perdre_evenement(tmp_path, monkeypatch):
     connexion = sqlite3.connect(donnees.CHEMIN_BASE)
     try:
         assert connexion.execute("SELECT count(*) FROM events").fetchone()[0] == 1
-        assert connexion.execute("SELECT state FROM events").fetchone()[0] == "derniere_etape"
+        assert connexion.execute("SELECT state FROM events").fetchone()[0] == "a_envoyer"
         assert connexion.execute("SELECT count(*) FROM observations").fetchone()[0] == 1
         observation = json.loads(connexion.execute("SELECT resultat FROM observations").fetchone()[0])
         assert observation["document_pdf"].endswith("/documents/105/40/document.pdf")
@@ -114,7 +114,7 @@ def test_post_ne_consulte_pas_esup_et_reprise_par_traitement(tmp_path, monkeypat
     connecteur.consulter_evenement(seconde.json()["event_id"])
     connexion = sqlite3.connect(donnees.CHEMIN_BASE)
     try:
-        assert connexion.execute("SELECT state FROM events").fetchone()[0] == "derniere_etape"
+        assert connexion.execute("SELECT state FROM events").fetchone()[0] == "a_envoyer"
     finally:
         connexion.close()
 
