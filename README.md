@@ -38,7 +38,7 @@ d'import nécessite une vérification manuelle ; il ne corrige ni ESUP ni Yousig
 | Fichier | Responsabilité |
 | --- | --- |
 | `connector/app.py` | Recevoir les POST, valider les cinq champs, enregistrer la notification et répondre. Aucun appel aux API. |
-| `connector/donnees.py` | Créer et utiliser SQLite. Toutes les requêtes SQL sont ici ; aucun appel réseau. |
+| `connector/donnees.py` | Lire et écrire les données SQLite. Le fichier `connector/schema.sql` définit les tables et la vue. |
 | `connector/esup.py` | Lire une demande, son PDF et son contexte, puis envoyer le PDF signé à l'API ESUP. Aucun accès SQLite ni décision d'envoi. |
 | `connector/yousign.py` | Construire les requêtes Yousign : brouillon, document, signataires, activation, statut et téléchargement. Aucun accès SQLite. |
 | `connector/traitement.py` | Organiser le parcours, décider si l'étape est la dernière, gérer les reprises et enregistrer la progression. |
@@ -117,10 +117,22 @@ serveur HTTP répond ; il ne vérifie ni SQLite ni les API.
 
 | Table | Contenu |
 | --- | --- |
-| `events` | Notification JSON unique, identifiant local, état et date UTC de première réception. |
-| `observations` | Dernière analyse ESUP par événement, signataires, placements et chemin du PDF courant. Une nouvelle consultation remplace l'observation. |
-| `brouillons_yousign` | Suivi unique par demande ESUP et étape : contexte ESUP initial, identifiants Yousign, phase en cours, statut, liens privés, chemin du PDF signé et confirmation du retour ESUP. |
-| `configuration_yousign` | URL API liée à cette base, pour éviter de mélanger Sandbox et production. |
+| `events` | Notification ESUP. Les cinq colonnes demande, statut, numéro d’étape, acteur et commentaire identifient un doublon. |
+| `observations` | Dernière analyse par événement, règles de l’étape, motif, chemin du PDF courant et date UTC. |
+| `destinataires_observes` | Destinataires lus dans ESUP pour cet événement, avec leur identité et leur état de signature. |
+| `emplacements` | Une ligne par zone du destinataire observé, avec le document, la page, les coordonnées, les dimensions et les options de placement. |
+| `brouillons_yousign` | Une ligne par demande ESUP et étape. Elle porte le contexte initial, les identifiants du brouillon et du document, la progression, les erreurs et la confirmation du retour du PDF. |
+| `signataires` | Correspondance entre destinataire ESUP et signataire Yousign, statut individuel et lien privé. |
+| `configuration_yousign` | URL de l’API liée à la base pour distinguer Sandbox et production. |
+
+Pour passer au nouveau schéma en développement, arrêter le timer et les services
+du connecteur, supprimer l’ancienne base `events.sqlite3`, puis redémarrer le
+service HTTP et le timer. Le connecteur crée les tables au premier cycle ou à
+la première notification.
+
+Pour consulter les signataires et leurs liens dans DBeaver, filtrer la table
+`signataires` sur la colonne `demande`. Les colonnes `demande` et `etape` la relient
+à `brouillons_yousign`. Les emplacements se retrouvent par `event_id` et `id_destinataire`.
 
 Les états d'événement principaux sont : `received`, `ignoree`, `a_reprendre`,
 `erreur`, `a_envoyer`, `transmis_yousign` et `erreur_yousign`. Une dernière étape
@@ -135,7 +147,7 @@ comme entièrement signé.
 Si l'appel de retour échoue, le prochain passage renvoie le même PDF, la même
 référence et le même contexte initial. Si ESUP avait déjà traité l'import mais
 que sa réponse avait été perdue, il répond `duplicate: true` sans ajouter une
-seconde version. Le suivi `retour_esup` conserve cette confirmation, notamment
+seconde version. La table `brouillons_yousign` conserve cette confirmation, notamment
 l'identifiant du document et le statut du parapheur. Un conflit HTTP 409 signifie
 qu'il faut vérifier manuellement le parapheur : le connecteur ne renouvelle pas
 le contexte pour forcer l'import. Les erreurs restent visibles dans le journal.

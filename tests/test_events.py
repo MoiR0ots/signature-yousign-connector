@@ -81,3 +81,23 @@ def test_notification_incomplete_est_refusee(tmp_path, monkeypatch):
     reponse = client.post("/esup/events", json={"status": "pending", "step": "2"})
     assert reponse.status_code == 400
     assert not chemin_base.exists()
+
+
+def test_deduplication_sur_les_cinq_colonnes(tmp_path, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+
+    monkeypatch.setattr(donnees, "CHEMIN_BASE", tmp_path / "events.sqlite3")
+    evenement = connecteur.preparer_evenement({
+        "signRequestId": 34, "status": "pending", "step": 2, "comment": None
+    })
+
+    def recevoir(numero):
+        donnees.initialiser_base()
+        return donnees.enregistrer_evenement(evenement)
+
+    with ThreadPoolExecutor(max_workers=4) as receptions:
+        resultats = list(receptions.map(recevoir, range(4)))
+    assert sum(not resultat["duplicate"] for resultat in resultats) == 1
+    assert donnees.lire_evenement(resultats[0]["event_id"]) == evenement
+    for champ in ("userEppn", "comment"):
+        assert not donnees.enregistrer_evenement(dict(evenement, **{champ: "autre"}))["duplicate"]

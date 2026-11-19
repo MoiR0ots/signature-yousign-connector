@@ -1,7 +1,6 @@
 """Vérifier le brouillon sans joindre Yousign ni utiliser de vraie clé."""
 
 import pytest
-import json
 import sqlite3
 import hashlib
 from pathlib import Path
@@ -59,7 +58,7 @@ def test_brouillon_et_relance_sans_double_creation(tmp_path, monkeypatch):
         appels.append((methode, chemin, donnees))
         if methode == "POST" and chemin == "/signature_requests":
             # La sauvegarde doit précéder même le tout premier POST Yousign.
-            historique = json.loads(base.lister_brouillons()[0][2])
+            historique = base.lister_brouillons()[0][2]
             assert historique['contexte_esup']['expectedStepId'] == 209
         if chemin.endswith("/documents"):
             return {"id": "document-test"}
@@ -158,31 +157,26 @@ def test_activation_email_et_recuperation_apres_signature(tmp_path, monkeypatch)
         return dict(etat)
 
     monkeypatch.setattr(yousign, 'appeler_api', repondre)
-    connexion = sqlite3.connect(donnees.CHEMIN_BASE)
     suivi = {'demande_id': 'demande-test', 'document_id': 'document-test',
              'signataires': {'210': 'signataire-test'}, 'pret': True, 'en_cours': ''}
     suivi['contexte_esup'] = esup.lire_contexte_retour('203')
-    connexion.execute('INSERT INTO brouillons_yousign VALUES (?, ?, ?)',
-                      ('203', '209', json.dumps(suivi)))
-    connexion.commit()
-    try:
-        traitement.actualiser_demande( '203', '209', suivi)
-        assert all(methode != 'PATCH' for methode, chemin, donnees in appels)
-        assert suivi['statut_yousign'] == 'ongoing'
-        traitement.actualiser_demande( '203', '209', suivi)
-        assert sum(chemin.endswith('/activate') for methode, chemin, donnees in appels) == 1
-        etat['status'] = 'done'
+    donnees.reserver_brouillon('203', '209', esup.lire_contexte_retour('203'))
+    donnees.sauvegarder_brouillon('203', '209', suivi)
+    traitement.actualiser_demande( '203', '209', suivi)
+    assert all(methode != 'PATCH' for methode, chemin, donnees in appels)
+    assert suivi['statut_yousign'] == 'ongoing'
+    traitement.actualiser_demande( '203', '209', suivi)
+    assert sum(chemin.endswith('/activate') for methode, chemin, donnees in appels) == 1
+    etat['status'] = 'done'
 
-        def telecharger(chemin, document, destination):
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            destination.write_bytes(b'%PDF-1.7\n%%EOF')
+    def telecharger(chemin, document, destination):
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(b'%PDF-1.7\n%%EOF')
 
-        monkeypatch.setattr(yousign, 'telecharger_pdf_signe', telecharger)
-        traitement.actualiser_demande( '203', '209', suivi)
-        assert Path(suivi['document_signe']).exists()
-        assert 'liens_signature' not in suivi
-    finally:
-        connexion.close()
+    monkeypatch.setattr(yousign, 'telecharger_pdf_signe', telecharger)
+    traitement.actualiser_demande( '203', '209', suivi)
+    assert Path(suivi['document_signe']).exists()
+    assert 'liens_signature' not in suivi
 
 
 def test_activation_refusee_ne_repete_pas_les_invitations(tmp_path, monkeypatch):
@@ -196,20 +190,15 @@ def test_activation_refusee_ne_repete_pas_les_invitations(tmp_path, monkeypatch)
         return {'status': 'draft'}
 
     monkeypatch.setattr(yousign, 'appeler_api', repondre)
-    connexion = sqlite3.connect(donnees.CHEMIN_BASE)
     suivi = {'demande_id': 'demande-test', 'document_id': 'document-test',
              'signataires': {}, 'pret': True, 'en_cours': ''}
-    connexion.execute('INSERT INTO brouillons_yousign VALUES (?, ?, ?)',
-                      ('203', '209', json.dumps(suivi)))
-    connexion.commit()
-    try:
-        with pytest.raises(ValueError, match='Refus Sandbox'):
-            traitement.actualiser_demande( '203', '209', suivi)
+    donnees.reserver_brouillon('203', '209', esup.lire_contexte_retour('203'))
+    donnees.sauvegarder_brouillon('203', '209', suivi)
+    with pytest.raises(ValueError, match='Refus Sandbox'):
         traitement.actualiser_demande( '203', '209', suivi)
-        assert appels.count('POST') == 1
-        assert suivi['activation_bloquee'] is True
-    finally:
-        connexion.close()
+    traitement.actualiser_demande( '203', '209', suivi)
+    assert appels.count('POST') == 1
+    assert suivi['activation_bloquee'] is True
 
 
 def test_cycle_automatique_jusqu_au_pdf_signe(tmp_path, monkeypatch):
@@ -252,7 +241,7 @@ def test_cycle_automatique_jusqu_au_pdf_signe(tmp_path, monkeypatch):
     connexion = sqlite3.connect(donnees.CHEMIN_BASE)
     try:
         assert connexion.execute('SELECT state FROM events').fetchone()[0] == 'transmis_yousign'
-        suivi = json.loads(connexion.execute('SELECT suivi FROM brouillons_yousign').fetchone()[0])
+        suivi = donnees.lister_brouillons()[0][2]
         assert suivi['statut_yousign'] == 'done'
         assert suivi['retour_esup']['documentId'] == 300
     finally:
@@ -287,11 +276,8 @@ def test_retour_repris_apres_perte_de_reponse(tmp_path, monkeypatch):
     suivi = {'demande_id': 'demande-test', 'document_id': 'document-test',
              'signataires': {}, 'pret': True, 'en_cours': '',
              'contexte_esup': contexte}
-    connexion = sqlite3.connect(donnees.CHEMIN_BASE)
-    connexion.execute('INSERT INTO brouillons_yousign VALUES (?, ?, ?)',
-                      ('203', '209', json.dumps(suivi)))
-    connexion.commit()
-    connexion.close()
+    donnees.reserver_brouillon('203', '209', esup.lire_contexte_retour('203'))
+    donnees.sauvegarder_brouillon('203', '209', suivi)
     monkeypatch.setattr(yousign, 'lire_demande', lambda identifiant: {'status': 'done'})
     telechargements = []
 
@@ -319,7 +305,7 @@ def test_retour_repris_apres_perte_de_reponse(tmp_path, monkeypatch):
     assert len(envois) == 2
     assert envois[0] == envois[1]
     assert len(telechargements) == 1
-    resultat = json.loads(donnees.lister_brouillons()[0][2])
+    resultat = donnees.lister_brouillons()[0][2]
     assert resultat['retour_esup']['duplicate'] is True
 
 
@@ -374,7 +360,8 @@ def test_post_incertain_reste_visible_sans_relance(tmp_path, monkeypatch):
 
 def test_lien_initialement_vide_puis_disponible(tmp_path, monkeypatch):
     creer_observation(tmp_path, monkeypatch)
-    suivi = {"demande_id": "test", "signataires": {"210": "a", "211": "b"},
+    donnees.reserver_brouillon("203", "209", esup.lire_contexte_retour("203"))
+    suivi = {"demande_id": "test", "pret": True, "en_cours": "", "signataires": {"210": "a", "211": "b"},
              "liens_signature": {"210": None, "211": None}}
     monkeypatch.setattr(yousign, "lire_demande", lambda demande: {
         "status": "ongoing", "signers": [{"id": "a", "status": "notified"}, {"id": "b", "status": "signed"}]
@@ -418,3 +405,23 @@ def test_ancienne_erreur_et_notification_plus_recente(tmp_path, monkeypatch):
     assert donnees.evenements_a_traiter() == [(reception["event_id"],)]
     with sqlite3.connect(donnees.CHEMIN_BASE) as connexion:
         assert connexion.execute("SELECT * FROM dossiers_a_verifier").fetchall() == []
+
+
+def test_suivi_relationnel_apres_reouverture(tmp_path, monkeypatch):
+    creer_observation(tmp_path, monkeypatch)
+    contexte = esup.lire_contexte_retour("203")
+    suivi = donnees.reserver_brouillon("203", "209", contexte)
+    suivi.update(demande_id="demande-test", document_id="document-test", en_cours="", pret=True,
+                 statut_yousign="ongoing", active_le="2026-11-19T10:00:00Z",
+                 signataires={"210": "alice", "211": "bob"}, liens_signature={"211": "lien-fictif"},
+                 statuts_signataires={"210": "signed", "211": "notified"})
+    donnees.sauvegarder_brouillon("203", "209", suivi)
+    assert donnees.lister_brouillons() == [("203", "209", suivi)]
+    suivi.pop("liens_signature")
+    suivi.update(statut_yousign="done", termine_le="2026-11-19T11:00:00Z", document_signe="signe.pdf",
+                 retour_esup={"signRequestId": 203, "documentId": 300, "status": "completed",
+                              "signBookStatus": "completed", "duplicate": False})
+    donnees.sauvegarder_brouillon("203", "209", suivi)
+    assert donnees.lister_brouillons() == [("203", "209", suivi)]
+    with sqlite3.connect(donnees.CHEMIN_BASE) as connexion:
+        assert connexion.execute("SELECT lien_signature FROM signataires").fetchall() == [(None,), (None,)]

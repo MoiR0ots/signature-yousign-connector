@@ -202,7 +202,8 @@ def preparer_brouillon(identifiant_evenement, observation):
         cle = str(personne["id_esup"])
         if cle in suivi["signataires"]:
             continue
-        suivi["en_cours"] = "signataire_" + cle
+        suivi["en_cours"] = "signataire"
+        suivi["id_destinataire_en_cours"] = cle
         donnees.sauvegarder_brouillon(demande, etape, suivi)
         reponse = yousign.ajouter_signataire(suivi["demande_id"], suivi["document_id"], personne)
         suivi["signataires"][cle] = reponse["id"]
@@ -211,6 +212,7 @@ def preparer_brouillon(identifiant_evenement, observation):
         raise ValueError("La demande Yousign n'est pas en brouillon")
     suivi["pret"] = True
     suivi["en_cours"] = ""
+    suivi.pop("id_destinataire_en_cours", None)
     donnees.sauvegarder_brouillon(demande, etape, suivi)
     return suivi
 
@@ -336,8 +338,7 @@ def traiter_evenements():
 
 def suivre_demandes():
     """Suivre les demandes prêtes et réintégrer les PDF terminés dans ESUP."""
-    for demande, etape, texte in donnees.lister_brouillons():
-        suivi = json.loads(texte)
+    for demande, etape, suivi in donnees.lister_brouillons():
         if not suivi["pret"] or suivi["en_cours"]:
             continue
         if suivi.get("statut_yousign") == "done" and suivi.get("retour_esup") and suivi.get("document_signe"):

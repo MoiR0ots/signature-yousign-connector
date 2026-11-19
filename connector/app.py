@@ -26,6 +26,11 @@ def preparer_evenement(notification):
         "userEppn": notification.get("userEppn", ""),
         "comment": notification.get("comment", ""),
     }
+    for nom_champ in ("userEppn", "comment"):
+        if evenement[nom_champ] is None:
+            evenement[nom_champ] = ""
+        elif not isinstance(evenement[nom_champ], str):
+            raise HTTPException(status_code=400, detail="Champ incorrect : " + nom_champ)
     return evenement
 
 

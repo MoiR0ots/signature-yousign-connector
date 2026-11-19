@@ -1,281 +1,208 @@
-"""Stockage SQLite : notifications, observations et suivi des demandes Yousign.
+"""Stockage relationnel du connecteur. Le schéma se trouve dans schema.sql."""
 
-Ce fichier ne fait aucun appel HTTP et n'importe aucun des clients API.
-L'appelant exécute initialiser_base() au début de son opération ; les autres
-fonctions utilisent ensuite les tables sans relancer leur création.
-"""
-
-import json
 import os
 import sqlite3
+from contextlib import contextmanager
 from pathlib import Path
 
 DOSSIER_PROJET = Path(__file__).resolve().parent.parent
 CHEMIN_BASE = Path(os.environ.get("CONNECTOR_DB", DOSSIER_PROJET / "data/events.sqlite3"))
+SCHEMA = Path(__file__).with_name("schema.sql").read_text(encoding="utf-8")
+
+
+@contextmanager
+def ouvrir_base():
+    """Valider ensemble les écritures ou les annuler si le traitement échoue."""
+    connexion = sqlite3.connect(CHEMIN_BASE, timeout=10)
+    connexion.execute("PRAGMA foreign_keys=ON")
+    try:
+        with connexion:
+            yield connexion
+    finally:
+        connexion.close()
 
 
 def initialiser_base():
-    """Créer les tables au début d’une réception, d’un cycle ou d’une commande."""
     CHEMIN_BASE.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     if not CHEMIN_BASE.exists():
         CHEMIN_BASE.touch(mode=0o600)
-
-    connexion = sqlite3.connect(CHEMIN_BASE)
-    try:
-        # Un événement est identifié directement par son contenu JSON unique.
-        # state servira à suivre son traitement dans la suite du POC.
-        connexion.execute("""
-            CREATE TABLE IF NOT EXISTS events (
-                id INTEGER PRIMARY KEY,
-                payload TEXT NOT NULL UNIQUE,
-                state TEXT NOT NULL DEFAULT 'received',
-                received_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        # Une table séparée évite de modifier les événements déjà enregistrés.
-        connexion.execute("""
-            CREATE TABLE IF NOT EXISTS observations (
-                event_id INTEGER PRIMARY KEY,
-                resultat TEXT NOT NULL,
-                observed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        connexion.execute("""
-            CREATE TABLE IF NOT EXISTS brouillons_yousign (
-                demande TEXT NOT NULL, etape TEXT NOT NULL, suivi TEXT NOT NULL,
-                PRIMARY KEY (demande, etape)
-            )
-        """)
-        connexion.execute("""
-            CREATE TABLE IF NOT EXISTS configuration_yousign (
-                id INTEGER PRIMARY KEY, api_url TEXT NOT NULL
-            )
-        """)
-        # Une vue se consulte comme une table dans DBeaver et reflète les
-        # corrections dès le cycle suivant, sans déplacer les notifications.
-        connexion.execute("""
-            CREATE VIEW IF NOT EXISTS dossiers_a_verifier AS
-            WITH derniers AS (
-                SELECT max(id) AS id, json_extract(payload, '$.signRequestId') AS demande
-                FROM events GROUP BY json_extract(payload, '$.signRequestId')
-            )
-            SELECT d.demande, e.id AS evenement,
-                   json_extract(e.payload, '$.step') AS numero_etape,
-                   json_extract(o.resultat, '$.id_etape') AS id_etape_esup,
-                   json_extract(b.suivi, '$.demande_id') AS id_yousign,
-                   CASE WHEN b.demande IS NULL THEN 'avant envoi' ELSE 'préparation' END AS phase,
-                   CASE WHEN b.demande IS NULL THEN 'Relecture ESUP après 5 minutes'
-                        ELSE 'Vérification manuelle' END AS reprise,
-                   coalesce(json_extract(o.resultat, '$.detail'),
-                            json_extract(o.resultat, '$.motif'), 'Consulter le journal') AS motif,
-                   CASE WHEN b.demande IS NULL THEN
-                       datetime(coalesce(o.observed_at, e.received_at), '+5 minutes')
-                   END AS prochain_essai_utc
-            FROM derniers d JOIN events e ON e.id=d.id
-            LEFT JOIN observations o ON o.event_id=e.id
-            LEFT JOIN brouillons_yousign b ON b.demande=d.demande
-                AND (json_extract(o.resultat, '$.id_etape') IS NULL OR
-                     b.etape=CAST(json_extract(o.resultat, '$.id_etape') AS TEXT))
-            WHERE e.state IN ('erreur', 'erreur_yousign')
-              AND coalesce(json_extract(b.suivi, '$.en_cours'), '') = ''
-              AND NOT coalesce(json_extract(b.suivi, '$.activation_bloquee'), 0)
-              AND json_extract(b.suivi, '$.erreur') IS NULL
-            UNION ALL
-            SELECT demande, NULL, NULL, etape, json_extract(suivi, '$.demande_id'),
-                   CASE WHEN json_extract(suivi, '$.activation_bloquee') THEN 'activation'
-                        WHEN json_extract(suivi, '$.en_cours') != ''
-                        THEN json_extract(suivi, '$.en_cours') ELSE 'suivi' END,
-                   CASE WHEN json_extract(suivi, '$.activation_bloquee')
-                          OR json_extract(suivi, '$.en_cours') != ''
-                        THEN 'Vérification manuelle' ELSE 'Au prochain cycle' END,
-                   coalesce(json_extract(suivi, '$.erreur'),
-                            'Vérifier le résultat de la préparation dans Yousign'), NULL
-            FROM brouillons_yousign
-            WHERE json_extract(suivi, '$.en_cours') != ''
-               OR json_extract(suivi, '$.activation_bloquee')
-               OR json_extract(suivi, '$.erreur') IS NOT NULL
-        """)
-        connexion.commit()
-    finally:
-        # finally est exécuté même lorsqu'une erreur interrompt le bloc try.
-        connexion.close()
+    with ouvrir_base() as connexion:
+        connexion.executescript("BEGIN;\n" + SCHEMA + "\nCOMMIT;")
 
 
 def enregistrer_evenement(evenement):
-    """Enregistrer un événement nouveau ou retrouver celui qui existe déjà."""
-    # Trier les clés et retirer les espaces donne un texte JSON toujours identique.
-    # SQLite peut ainsi comparer directement les contenus des notifications.
-    texte_evenement = json.dumps(evenement, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-
-    connexion = sqlite3.connect(CHEMIN_BASE, timeout=10)
-    try:
-        # Réserver l'écriture pendant la recherche et l'enregistrement.
-        # Cela évite que deux POST simultanés créent chacun le même événement.
-        connexion.execute("BEGIN IMMEDIATE")
-        curseur = connexion.execute(
-            "SELECT id FROM events WHERE payload = ?",
-            (texte_evenement,),
-        )
-        ligne = curseur.fetchone()
-
-        if ligne is None:
-            curseur = connexion.execute(
-                "INSERT INTO events (payload) VALUES (?)",
-                (texte_evenement,),
-            )
-            identifiant_evenement = curseur.lastrowid
-            doublon = False
-        else:
-            # Un doublon conserve la date et l'état du premier enregistrement.
-            identifiant_evenement = ligne[0]
-            doublon = True
-
-        connexion.commit()
-    except sqlite3.Error:
-        # Si une écriture échoue, annuler toute la réception.
-        connexion.rollback()
-        raise
-    finally:
-        connexion.close()
-
-    # L'appelant peut acquitter la réception après le commit SQLite.
-    return {
-        "accepted": True,
-        "event_id": identifiant_evenement,
-        "duplicate": doublon,
-    }
+    valeurs = (evenement["signRequestId"], evenement["status"], evenement["step"],
+               evenement.get("userEppn", ""), evenement.get("comment", ""))
+    with ouvrir_base() as connexion:
+        ajout = connexion.execute("""
+            INSERT INTO events (demande, statut_esup, numero_etape, acteur, commentaire)
+            VALUES (?, ?, ?, ?, ?) ON CONFLICT DO NOTHING
+        """, valeurs)
+        identifiant = ajout.lastrowid
+        doublon = ajout.rowcount == 0
+        if doublon:
+            identifiant, = connexion.execute("""
+                SELECT id FROM events WHERE demande=? AND statut_esup=? AND numero_etape=?
+                    AND acteur=? AND commentaire=?
+            """, valeurs).fetchone()
+    return {"accepted": True, "event_id": identifiant, "duplicate": doublon}
 
 
 def lire_evenement(identifiant):
-    """Lire une notification déjà enregistrée."""
-    connexion = sqlite3.connect(CHEMIN_BASE, timeout=10)
-    try:
-        ligne = connexion.execute("SELECT payload FROM events WHERE id=?", (identifiant,)).fetchone()
+    with ouvrir_base() as connexion:
+        connexion.row_factory = sqlite3.Row
+        ligne = connexion.execute("""
+            SELECT demande AS signRequestId, statut_esup AS status, numero_etape AS step,
+                   acteur AS userEppn, commentaire AS comment FROM events WHERE id=?
+        """, (identifiant,)).fetchone()
         if ligne is None:
             raise ValueError("Événement introuvable")
-        return json.loads(ligne[0])
-    finally:
-        connexion.close()
+        return dict(ligne)
 
 
 def evenements_a_traiter():
-    """Sélectionner la dernière notification par demande, puis vérifier son échéance."""
-    connexion = sqlite3.connect(CHEMIN_BASE, timeout=10)
-    try:
+    with ouvrir_base() as connexion:
         return connexion.execute("""
-            SELECT e.id FROM events e
-            WHERE e.id IN (
-                SELECT max(id) FROM events GROUP BY json_extract(payload, '$.signRequestId')
-            ) AND (
-                e.state IN ('received', 'a_reprendre', 'a_envoyer')
-                OR e.id IN (
-                    SELECT evenement FROM dossiers_a_verifier
-                    WHERE prochain_essai_utc <= CURRENT_TIMESTAMP
-                )
-            ) ORDER BY e.id
+            SELECT id FROM events WHERE id IN (SELECT max(id) FROM events GROUP BY demande)
+            AND (state IN ('received', 'a_reprendre', 'a_envoyer') OR id IN (
+                SELECT evenement FROM dossiers_a_verifier WHERE prochain_essai_utc <= CURRENT_TIMESTAMP
+            )) ORDER BY id
         """).fetchall()
-    finally:
-        connexion.close()
 
 
 def changer_etat_evenement(identifiant, etat):
-    """Enregistrer la décision prise par le traitement."""
-    connexion = sqlite3.connect(CHEMIN_BASE, timeout=10)
-    try:
+    with ouvrir_base() as connexion:
         connexion.execute("UPDATE events SET state=? WHERE id=?", (etat, identifiant))
-        connexion.commit()
-    finally:
-        connexion.close()
 
 
 def enregistrer_observation(identifiant, resultat, etat):
-    """Conserver ensemble l'observation et le nouvel état de l'événement."""
-    connexion = sqlite3.connect(CHEMIN_BASE, timeout=10)
-    try:
-        connexion.execute("INSERT OR REPLACE INTO observations (event_id,resultat) VALUES (?,?)",
-                          (identifiant, json.dumps(resultat, ensure_ascii=False)))
+    with ouvrir_base() as connexion:
+        # Le remplacement supprime aussi les anciennes zones et les anciens destinataires.
+        connexion.execute("DELETE FROM observations WHERE event_id=?", (identifiant,))
+        connexion.execute("""
+            INSERT INTO observations (event_id, etat, motif, detail, id_etape, numero_etape,
+                                      type_signature, toutes_signatures_requises, document_pdf)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (identifiant, resultat["etat"], resultat.get("motif"), resultat.get("detail"),
+              resultat.get("id_etape"), resultat.get("numero_etape"), resultat.get("type_signature"),
+              resultat.get("toutes_signatures_requises"), resultat.get("document_pdf")))
+        for personne in resultat.get("signataires", []):
+            connexion.execute("""
+                INSERT INTO destinataires_observes (event_id, id_destinataire, prenom, nom, email, type, deja_signe)
+                VALUES (:event_id, :id_destinataire, :prenom, :nom, :email, :type, :deja_signe)
+            """, dict(personne, event_id=identifiant))
+            for numero, zone in enumerate(personne["emplacements"], start=1):
+                connexion.execute("""
+                    INSERT INTO emplacements (event_id, id_destinataire, numero, document, page, x, y,
+                                              largeur, hauteur, rotation, echelle, toutes_les_pages, champ_pdf)
+                    VALUES (:event_id, :destinataire, :numero, :document, :page, :x, :y,
+                            :largeur, :hauteur, :rotation, :echelle, :toutes_les_pages, :champ_pdf)
+                """, dict(zone, event_id=identifiant, destinataire=personne["id_destinataire"],
+                          numero=numero, echelle=zone.get("echelle", 1)))
         connexion.execute("UPDATE events SET state=? WHERE id=?", (etat, identifiant))
-        connexion.commit()
-    finally:
-        connexion.close()
 
 
 def verifier_environnement(adresse_api):
-    """Lier la base à une API pour ne pas mélanger Sandbox et production."""
-    connexion = sqlite3.connect(CHEMIN_BASE, timeout=10)
-    try:
-        connexion.execute("BEGIN IMMEDIATE")
-        ligne = connexion.execute("SELECT api_url FROM configuration_yousign WHERE id=1").fetchone()
-        if ligne is None:
-            adresse = adresse_api
-            connexion.execute("INSERT INTO configuration_yousign VALUES (1,?)", (adresse,))
-        else:
-            adresse = ligne[0]
-        connexion.commit()
+    with ouvrir_base() as connexion:
+        connexion.execute("INSERT INTO configuration_yousign VALUES (1, ?) ON CONFLICT DO NOTHING", (adresse_api,))
+        adresse, = connexion.execute("SELECT api_url FROM configuration_yousign WHERE id=1").fetchone()
         if adresse != adresse_api:
             raise ValueError("Cette base utilise une autre API Yousign : choisir un nouveau dossier de données")
-    finally:
-        connexion.close()
+
+
+def lire_suivi(connexion, ligne):
+    """Rassembler la ligne du brouillon et ses signataires pour le cycle en cours."""
+    suivi = {
+        "en_cours": ligne["en_cours"], "pret": bool(ligne["pret"]),
+        "demande_id": ligne["id_demande_yousign"], "document_id": ligne["id_document_yousign"],
+        "contexte_esup": {
+            "signRequestId": int(ligne["demande"]), "expectedStepId": int(ligne["etape"]),
+            "contextHash": ligne["empreinte_contexte"], "sourceDocumentId": ligne["id_document_source"],
+            "sourceSha256": ligne["sha256_source"],
+        },
+        "signataires": {},
+    }
+    for champ in ("id_destinataire_en_cours", "erreur", "statut_yousign", "active_le", "termine_le", "document_signe"):
+        if ligne[champ] is not None:
+            suivi[champ] = ligne[champ]
+    if ligne["activation_bloquee"]:
+        suivi["activation_bloquee"] = True
+    if ligne["id_document_retour"] is not None:
+        suivi["retour_esup"] = {
+            "signRequestId": int(ligne["demande"]), "documentId": ligne["id_document_retour"],
+            "status": ligne["statut_demande_retour"], "signBookStatus": ligne["statut_parapheur_retour"],
+            "duplicate": bool(ligne["retour_doublon"]),
+        }
+    for personne in connexion.execute("SELECT * FROM signataires WHERE demande=? AND etape=?",
+                                      (ligne["demande"], ligne["etape"])):
+        cle = personne["id_destinataire_esup"]
+        suivi["signataires"][cle] = personne["id_signataire_yousign"]
+        if personne["statut_yousign"] is not None:
+            suivi.setdefault("statuts_signataires", {})[cle] = personne["statut_yousign"]
+        if personne["lien_signature"] is not None:
+            suivi.setdefault("liens_signature", {})[cle] = personne["lien_signature"]
+    return suivi
 
 
 def reserver_brouillon(demande, etape, contexte):
-    """Réserver atomiquement une préparation et empêcher un deuxième POST incertain."""
-    connexion = sqlite3.connect(CHEMIN_BASE, timeout=10)
-    try:
+    """Réserver le premier POST et conserver le contexte initial en une transaction."""
+    with ouvrir_base() as connexion:
+        connexion.row_factory = sqlite3.Row
         connexion.execute("BEGIN IMMEDIATE")
-        ligne = connexion.execute("SELECT suivi FROM brouillons_yousign WHERE demande=? AND etape=?",
+        connexion.execute("""
+            INSERT INTO brouillons_yousign (demande, etape, empreinte_contexte, id_document_source,
+                                            sha256_source, en_cours)
+            VALUES (?, ?, ?, ?, ?, '') ON CONFLICT (demande, etape) DO NOTHING
+        """, (demande, etape, contexte["contextHash"], contexte["sourceDocumentId"], contexte["sourceSha256"]))
+        ligne = connexion.execute("SELECT * FROM brouillons_yousign WHERE demande=? AND etape=?",
                                   (demande, etape)).fetchone()
-        if ligne is None:
-            suivi = {"en_cours": "", "demande_id": None,
-                     "document_id": None, "signataires": {}, "pret": False,
-                     "contexte_esup": contexte}
-            connexion.execute("INSERT INTO brouillons_yousign VALUES (?,?,?)",
-                              (demande, etape, json.dumps(suivi)))
-        else:
-            suivi = json.loads(ligne[0])
+        suivi = lire_suivi(connexion, ligne)
         if suivi["en_cours"]:
             raise ValueError("Préparation en cours ou résultat incertain : vérifier Yousign et SQLite avant reprise")
-        # Ne jamais remplacer le contexte initial par l'état courant d'ESUP.
         if suivi["contexte_esup"] != contexte:
             raise ValueError("Le contexte ESUP a changé : vérifier la demande")
         if not suivi["pret"]:
-            suivi["en_cours"] = "creation" if not suivi["demande_id"] else "reprise"
-            connexion.execute("UPDATE brouillons_yousign SET suivi=? WHERE demande=? AND etape=?",
-                              (json.dumps(suivi), demande, etape))
-        connexion.commit()
+            suivi["en_cours"] = "reprise" if suivi["demande_id"] else "creation"
+            connexion.execute("UPDATE brouillons_yousign SET en_cours=? WHERE demande=? AND etape=?",
+                              (suivi["en_cours"], demande, etape))
         return suivi
-    finally:
-        connexion.close()
 
 
 def sauvegarder_brouillon(demande, etape, suivi):
-    """Valider le suivi après chaque étape de préparation ou de signature."""
-    connexion = sqlite3.connect(CHEMIN_BASE, timeout=10)
-    try:
-        connexion.execute("UPDATE brouillons_yousign SET suivi=? WHERE demande=? AND etape=?",
-                          (json.dumps(suivi, ensure_ascii=False), demande, etape))
-        connexion.commit()
-    finally:
-        connexion.close()
+    retour = suivi.get("retour_esup", {})
+    with ouvrir_base() as connexion:
+        connexion.execute("""
+            UPDATE brouillons_yousign SET id_demande_yousign=?, id_document_yousign=?, en_cours=?,
+                id_destinataire_en_cours=?, pret=?, activation_bloquee=?, erreur=?, statut_yousign=?, active_le=?, termine_le=?,
+                document_signe=?, id_document_retour=?, statut_demande_retour=?, statut_parapheur_retour=?,
+                retour_doublon=? WHERE demande=? AND etape=?
+        """, (suivi.get("demande_id"), suivi.get("document_id"), suivi["en_cours"],
+              suivi.get("id_destinataire_en_cours"), suivi["pret"],
+              suivi.get("activation_bloquee", False), suivi.get("erreur"), suivi.get("statut_yousign"),
+              suivi.get("active_le"), suivi.get("termine_le"), suivi.get("document_signe"),
+              retour.get("documentId"), retour.get("status"), retour.get("signBookStatus"),
+              retour.get("duplicate"), demande, etape))
+        for destinataire, identifiant in suivi["signataires"].items():
+            connexion.execute("""
+                INSERT INTO signataires (demande, etape, id_destinataire_esup, id_signataire_yousign,
+                                         statut_yousign, lien_signature)
+                VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (demande, etape, id_destinataire_esup)
+                DO UPDATE SET statut_yousign=excluded.statut_yousign, lien_signature=excluded.lien_signature
+            """, (demande, etape, destinataire, identifiant,
+                  suivi.get("statuts_signataires", {}).get(destinataire),
+                  suivi.get("liens_signature", {}).get(destinataire)))
 
 
 def lister_brouillons():
-    """Lire les correspondances ESUP / Yousign conservées sur disque."""
-    connexion = sqlite3.connect(CHEMIN_BASE, timeout=10)
-    try:
-        return connexion.execute("SELECT demande, etape, suivi FROM brouillons_yousign").fetchall()
-    finally:
-        connexion.close()
+    with ouvrir_base() as connexion:
+        connexion.row_factory = sqlite3.Row
+        connexion.execute("BEGIN")
+        return [(ligne["demande"], ligne["etape"], lire_suivi(connexion, ligne))
+                for ligne in connexion.execute("SELECT * FROM brouillons_yousign")]
 
 
 def noter_erreur_preparation(demande, etape, motif):
-    """Associer l’erreur au brouillon si un envoi a déjà été engagé."""
-    connexion = sqlite3.connect(CHEMIN_BASE, timeout=10)
-    try:
+    with ouvrir_base() as connexion:
         connexion.execute("""
-            UPDATE brouillons_yousign SET suivi=json_set(suivi, '$.erreur', ?)
-            WHERE demande=? AND etape=? AND json_extract(suivi, '$.en_cours') != ''
+            UPDATE brouillons_yousign SET erreur=? WHERE demande=? AND etape=? AND en_cours != ''
         """, (motif, demande, etape))
-        connexion.commit()
-    finally:
-        connexion.close()

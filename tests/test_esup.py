@@ -1,7 +1,6 @@
 """Vérifier la règle métier avec un circuit fictif, sans serveur ESUP."""
 
 import sqlite3
-import json
 import pytest
 from urllib.error import URLError
 
@@ -81,8 +80,8 @@ def test_erreur_puis_reprise_sans_perdre_evenement(tmp_path, monkeypatch):
         assert connexion.execute("SELECT count(*) FROM events").fetchone()[0] == 1
         assert connexion.execute("SELECT state FROM events").fetchone()[0] == "a_envoyer"
         assert connexion.execute("SELECT count(*) FROM observations").fetchone()[0] == 1
-        observation = json.loads(connexion.execute("SELECT resultat FROM observations").fetchone()[0])
-        assert observation["document_pdf"].endswith("/documents/105/40/document.pdf")
+        document_pdf, = connexion.execute("SELECT document_pdf FROM observations").fetchone()
+        assert document_pdf.endswith("/documents/105/40/document.pdf")
     finally:
         connexion.close()
 
@@ -212,3 +211,27 @@ def test_diagnostic_avant_telechargement(tmp_path, monkeypatch, champ, valeur, m
     observation = connecteur.consulter_evenement(reception["event_id"])
     assert motif in observation["detail"]
     assert observation["etat"] == "erreur"
+
+
+def test_remplacement_atomique_des_zones_et_destinataires(tmp_path, monkeypatch):
+    monkeypatch.setattr(donnees, "CHEMIN_BASE", tmp_path / "events.sqlite3")
+    donnees.initialiser_base()
+    evenement = {"signRequestId": "105", "status": "pending", "step": "2"}
+    identifiant = donnees.enregistrer_evenement(evenement)["event_id"]
+    observation = analyser_demande(construire_demande(), evenement)
+    personne = observation["signataires"][0]
+    personne["emplacements"].append(dict(personne["emplacements"][0], page=2))
+    donnees.enregistrer_observation(identifiant, observation, "a_envoyer")
+
+    # Si la deuxième écriture échoue, les emplacements précédents restent lisibles.
+    observation["signataires"].append(personne)
+    with pytest.raises(sqlite3.IntegrityError):
+        donnees.enregistrer_observation(identifiant, observation, "erreur")
+    with sqlite3.connect(donnees.CHEMIN_BASE) as connexion:
+        assert connexion.execute("SELECT state FROM events").fetchone() == ("a_envoyer",)
+        assert connexion.execute("SELECT page FROM emplacements ORDER BY numero").fetchall() == [(1,), (2,)]
+        assert connexion.execute("SELECT id_destinataire FROM destinataires_observes").fetchall() == [(41,)]
+        donnees.enregistrer_observation(identifiant, {"etat": "ignoree"}, "ignoree")
+        assert connexion.execute("SELECT * FROM emplacements").fetchall() == []
+        assert connexion.execute("SELECT * FROM destinataires_observes").fetchall() == []
+        assert connexion.execute("PRAGMA foreign_key_check").fetchall() == []
