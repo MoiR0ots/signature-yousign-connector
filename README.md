@@ -146,12 +146,24 @@ refusée conserve `activation_bloquee` et son erreur. Ces cas nécessitent encor
 une vérification manuelle des ressources distantes avant reprise. Il reste à
 prévoir leur réconciliation et une alerte en dehors des logs.
 
-**Point connu reporté :** une panne pendant la lecture du contexte ESUP, avant
-la création Yousign, classe actuellement l'événement en `erreur_yousign` et ne le
-retente pas automatiquement. Il reste à distinguer ces erreurs avant envoi des
-résultats de POST incertains. Ce comportement n'a pas été modifié par la dernière
-simplification ; consulter les journaux pour repérer une demande bloquée.
+Dans DBeaver, ouvrir la vue `dossiers_a_verifier` ou exécuter :
 
+```sql
+SELECT * FROM dossiers_a_verifier ORDER BY demande;
+```
+
+Avant tout envoi, le motif et la prochaine tentative (UTC) sont visibles dans la
+vue. Le timer relit ESUP après cinq minutes, y compris pour les anciennes erreurs
+sans réservation. Une correction dans ESUP suffit pour reprendre. Une notification
+plus récente prend la priorité. Une préparation incertaine ou une activation
+refusée reste visible avec sa phase et nécessite une vérification. Les erreurs
+de suivi ordinaires sont retentées au prochain cycle. Les lignes disparaissent
+quand le problème est résolu. Aucun paramètre de messagerie à configurer.
+
+Pendant la signature, le suivi conserve les statuts individuels disponibles et
+relit les liens manquants des destinataires en attente. Un lien peut rester vide
+avec la livraison par mail. Le diagnostic des refus HTTP conserve leur type API
+quand Yousign le fournit.
 
 Une modification ESUP avant création est prise en compte par la relecture du
 parapheur. Une modification après préparation Yousign n'est pas synchronisée :

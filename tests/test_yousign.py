@@ -321,3 +321,100 @@ def test_retour_repris_apres_perte_de_reponse(tmp_path, monkeypatch):
     assert len(telechargements) == 1
     resultat = json.loads(donnees.lister_brouillons()[0][2])
     assert resultat['retour_esup']['duplicate'] is True
+
+
+def test_reprise_avant_envoi_et_disparition_de_la_vue(tmp_path, monkeypatch):
+    evenement, observation = creer_observation(tmp_path, monkeypatch)
+    contexte = esup.lire_contexte_retour("203")
+    tentatives = []
+
+    def lire_contexte(demande):
+        tentatives.append(demande)
+        raise TimeoutError("Lecture du contexte indisponible")
+
+    monkeypatch.setattr(esup, "lire_contexte_retour", lire_contexte)
+    traitement.traiter_evenements()
+    traitement.traiter_evenements()
+    assert tentatives == ["203"]
+    with sqlite3.connect(donnees.CHEMIN_BASE) as connexion:
+        demande, motif, date = connexion.execute(
+            "SELECT demande, motif, prochain_essai_utc FROM dossiers_a_verifier"
+        ).fetchone()
+        assert (demande, motif) == ("203", "Lecture du contexte indisponible")
+        assert date
+        connexion.execute("UPDATE observations SET observed_at=datetime('now', '-6 minutes')")
+
+    monkeypatch.setattr(esup, "lire_contexte_retour", lambda demande: contexte)
+    monkeypatch.setattr(yousign, "appeler_api", lambda *args, **kwargs: {"id": "test", "status": "draft"})
+    traitement.traiter_evenements()
+    assert donnees.evenements_a_traiter() == []
+    with sqlite3.connect(donnees.CHEMIN_BASE) as connexion:
+        assert connexion.execute("SELECT * FROM dossiers_a_verifier").fetchall() == []
+        assert connexion.execute("SELECT state FROM events").fetchone() == ("transmis_yousign",)
+
+
+def test_post_incertain_reste_visible_sans_relance(tmp_path, monkeypatch):
+    creer_observation(tmp_path, monkeypatch)
+    appels = []
+
+    def perdre_reponse(*args):
+        appels.append(args)
+        raise TimeoutError("Réponse perdue")
+
+    monkeypatch.setattr(yousign, "creer_demande", perdre_reponse)
+    traitement.traiter_evenements()
+    with sqlite3.connect(donnees.CHEMIN_BASE) as connexion:
+        connexion.execute("UPDATE observations SET observed_at='2000-01-01'")
+        assert connexion.execute("SELECT phase, motif, prochain_essai_utc FROM dossiers_a_verifier").fetchall() == [
+            ("creation", "Réponse perdue", None)
+        ]
+    traitement.traiter_evenements()
+    assert len(appels) == 1
+
+
+def test_lien_initialement_vide_puis_disponible(tmp_path, monkeypatch):
+    creer_observation(tmp_path, monkeypatch)
+    suivi = {"demande_id": "test", "signataires": {"210": "a", "211": "b"},
+             "liens_signature": {"210": None, "211": None}}
+    monkeypatch.setattr(yousign, "lire_demande", lambda demande: {
+        "status": "ongoing", "signers": [{"id": "a", "status": "notified"}, {"id": "b", "status": "signed"}]
+    })
+    appels = []
+
+    def lire(demande, signataire):
+        appels.append(signataire)
+        return {"status": "notified", "signature_link": "lien-fictif"}
+
+    monkeypatch.setattr(yousign, "lire_signataire", lire)
+    traitement.actualiser_demande("203", "209", suivi)
+    traitement.actualiser_demande("203", "209", suivi)
+    assert appels == ["a"]
+    assert suivi["liens_signature"] == {"210": "lien-fictif"}
+    assert suivi["statuts_signataires"] == {"210": "notified", "211": "signed"}
+
+
+def test_refus_http_conserve_uniquement_le_type(monkeypatch):
+    from io import BytesIO
+    from urllib.error import HTTPError
+
+    def refuser(requete, timeout):
+        corps = BytesIO(b'{"type":"validation.error","detail":"donnee-privee"}')
+        raise HTTPError(requete.full_url, 400, "Bad Request", {}, corps)
+
+    monkeypatch.setenv("YOUSIGN_API_KEY", "cle-fictive")
+    monkeypatch.setattr(yousign, "urlopen", refuser)
+    with pytest.raises(ValueError, match=r"HTTP 400.*validation\.error") as erreur:
+        yousign.activer_demande("test")
+    assert "donnee-privee" not in str(erreur.value)
+
+
+def test_ancienne_erreur_et_notification_plus_recente(tmp_path, monkeypatch):
+    evenement, observation = creer_observation(tmp_path, monkeypatch)
+    donnees.enregistrer_observation(evenement, observation, "erreur_yousign")
+    with sqlite3.connect(donnees.CHEMIN_BASE) as connexion:
+        connexion.execute("UPDATE observations SET observed_at='2000-01-01'")
+    assert donnees.evenements_a_traiter() == [(evenement,)]
+    reception = donnees.enregistrer_evenement({"signRequestId": "203", "step": "2", "status": "completed"})
+    assert donnees.evenements_a_traiter() == [(reception["event_id"],)]
+    with sqlite3.connect(donnees.CHEMIN_BASE) as connexion:
+        assert connexion.execute("SELECT * FROM dossiers_a_verifier").fetchall() == []

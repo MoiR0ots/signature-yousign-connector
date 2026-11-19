@@ -98,9 +98,17 @@ def analyser_demande(demande, evenement):
     }
 
 
+def verifier_etape(observation):
+    if observation["type_signature"] != "signature":
+        raise ValueError("La dernière étape ESUP doit être de type signature")
+    if not observation["toutes_signatures_requises"]:
+        raise ValueError("Activer l’option imposant la signature de tous les destinataires dans ESUP")
+
+
 def consulter_evenement(identifiant_evenement):
     """Consulter ou reconsulter un événement enregistré, sans action de signature."""
     evenement = donnees.lire_evenement(identifiant_evenement)
+    resultat = {}
     try:
         if evenement["status"] != "pending":
             resultat = {"etat": "ignoree", "motif": "Notification autre que pending"}
@@ -120,6 +128,8 @@ def consulter_evenement(identifiant_evenement):
             if resultat["etat"] == "derniere_etape":
                 # Les documents suivent le dossier de la base : aucun chemin
                 # supplémentaire à configurer dans le playbook.
+                verifier_etape(resultat)
+                yousign.preparer_signataires(resultat)
                 resultat["document_pdf"] = esup.telecharger_document(
                     evenement["signRequestId"], resultat["id_etape"],
                     donnees.CHEMIN_BASE.parent / "documents",
@@ -127,9 +137,10 @@ def consulter_evenement(identifiant_evenement):
     except Exception as erreur:
         # Cette frontière protège la réception des erreurs réseau ou d'un format
         # ESUP inattendu. Le type d'erreur est conservé sans exposer la réponse API.
-        resultat = {"etat": "erreur", "motif": type(erreur).__name__}
+        resultat.update(etat="erreur", motif=type(erreur).__name__)
         if isinstance(erreur, ValueError):
             resultat["detail"] = str(erreur)
+        journal.warning("Événement %s : %s", identifiant_evenement, resultat.get("detail", resultat["motif"]))
 
     # Une dernière étape validée est toujours à envoyer au prochain traitement.
     if resultat["etat"] == "derniere_etape":
@@ -152,8 +163,7 @@ def preparer_brouillon(identifiant_evenement, observation):
     notification = donnees.lire_evenement(identifiant_evenement)
     demande = notification["signRequestId"]
     etape = str(observation["id_etape"])
-    if observation["type_signature"] != "signature" or not observation["toutes_signatures_requises"]:
-        raise ValueError("Le POC nécessite une étape de signature avec tous les signataires requis")
+    verifier_etape(observation)
     signataires = yousign.preparer_signataires(observation)
     pdf = Path(observation["document_pdf"])
     # Ce contexte sera présenté tel quel au retour. Il doit correspondre au PDF
@@ -169,9 +179,7 @@ def preparer_brouillon(identifiant_evenement, observation):
     observation_actuelle = analyser_demande(esup.lire_demande(demande), notification)
     if observation_actuelle["etat"] != "derniere_etape":
         raise ValueError("La demande ESUP n'est plus disponible à sa dernière étape")
-    if (observation_actuelle["type_signature"] != "signature"
-            or not observation_actuelle["toutes_signatures_requises"]):
-        raise ValueError("Les règles de signature ESUP ont changé avant l'envoi")
+    verifier_etape(observation_actuelle)
     if yousign.preparer_signataires(observation_actuelle) != signataires:
         raise ValueError("Les signataires ou leurs emplacements ont changé avant l'envoi")
     if esup.lire_contexte_retour(demande) != contexte:
@@ -232,14 +240,22 @@ def actualiser_demande(demande, etape, suivi):
         suivi.pop("erreur", None)
     donnees.sauvegarder_brouillon(demande, etape, suivi)
 
-    if reponse["status"] == "ongoing" and not suivi.get("liens_signature"):
-        # Les invitations sont envoyées par Yousign. Les liens restent aussi
-        # privés dans SQLite pour le diagnostic en cas de mail non reçu.
-        liens = {}
+    if reponse["status"] == "ongoing":
+        liens = suivi.setdefault("liens_signature", {})
+        statuts = suivi.setdefault("statuts_signataires", {})
+        # Le GET de suivi peut déjà contenir les statuts individuels.
+        par_id = {personne["id"]: personne for personne in reponse.get("signers", [])}
         for destinataire, identifiant in suivi["signataires"].items():
-            personne = yousign.lire_signataire(suivi["demande_id"], identifiant)
-            liens[destinataire] = personne.get("signature_link")
-        suivi["liens_signature"] = liens
+            personne = par_id.get(identifiant, {})
+            statut = personne.get("status") or statuts.get(destinataire)
+            if statut in ("signed", "declined", "aborted", "error"):
+                liens.pop(destinataire, None)
+            elif not liens.get(destinataire):
+                personne = yousign.lire_signataire(suivi["demande_id"], identifiant)
+                statut = personne.get("status", statut)
+                liens[destinataire] = personne.get("signature_link")
+            if statut:
+                statuts[destinataire] = statut
         donnees.sauvegarder_brouillon(demande, etape, suivi)
     elif reponse["status"] == "done":
         suivi["termine_le"] = reponse.get("completed_at")
@@ -297,29 +313,25 @@ def executer_cycle():
 
 def traiter_evenements():
     """Relire les notifications en attente, sans rejouer les anciennes étapes."""
-    lignes = donnees.lister_evenements()
-    # Une demande peut avoir plusieurs notifications : seule la dernière reçue
-    # sert de point de départ. L'API ESUP reste la source de son état courant.
-    derniers = {}
-    for identifiant, texte, etat in lignes:
-        evenement = json.loads(texte)
-        derniers[evenement["signRequestId"]] = (identifiant, etat)
-    for identifiant, etat in derniers.values():
-        if etat not in ("received", "a_reprendre", "erreur", "a_envoyer"):
+    for (identifiant,) in donnees.evenements_a_traiter():
+        observation = consulter_evenement(identifiant)
+        if observation["etat"] != "derniere_etape":
             continue
         try:
-            observation = consulter_evenement(identifiant)
-            if observation["etat"] != "derniere_etape":
-                continue
             preparer_brouillon(identifiant, observation)
-            nouvel_etat = "transmis_yousign"
             journal.info("Événement %s : brouillon prêt", identifiant)
         except Exception as erreur:
             # Pas de POST répété aveuglément : le suivi garde la dernière phase
             # et bloque une création incertaine pour vérification manuelle.
-            nouvel_etat = "erreur_yousign"
+            observation["detail"] = str(erreur)
+            donnees.enregistrer_observation(identifiant, observation, "erreur_yousign")
+            # Après réservation, le suivi reste visible même si une nouvelle
+            # notification arrive pour la même demande.
+            demande = donnees.lire_evenement(identifiant)["signRequestId"]
+            donnees.noter_erreur_preparation(demande, str(observation["id_etape"]), str(erreur))
             journal.error("Événement %s : %s", identifiant, erreur)
-        donnees.changer_etat_evenement(identifiant, nouvel_etat)
+            continue
+        donnees.changer_etat_evenement(identifiant, "transmis_yousign")
 
 
 def suivre_demandes():
@@ -339,6 +351,9 @@ def suivre_demandes():
             if suivi.get("statut_yousign") != ancien_statut:
                 journal.info("Demande ESUP %s : Yousign %s", demande, suivi.get("statut_yousign"))
         except Exception as erreur:
+            if not suivi.get("activation_bloquee"):
+                suivi["erreur"] = str(erreur)
+                donnees.sauvegarder_brouillon(demande, etape, suivi)
             journal.error("Demande ESUP %s : %s", demande, erreur)
 
 

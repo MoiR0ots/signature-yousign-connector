@@ -51,6 +51,50 @@ def initialiser_base():
                 id INTEGER PRIMARY KEY, api_url TEXT NOT NULL
             )
         """)
+        # Une vue se consulte comme une table dans DBeaver et reflète les
+        # corrections dès le cycle suivant, sans déplacer les notifications.
+        connexion.execute("""
+            CREATE VIEW IF NOT EXISTS dossiers_a_verifier AS
+            WITH derniers AS (
+                SELECT max(id) AS id, json_extract(payload, '$.signRequestId') AS demande
+                FROM events GROUP BY json_extract(payload, '$.signRequestId')
+            )
+            SELECT d.demande, e.id AS evenement,
+                   json_extract(e.payload, '$.step') AS numero_etape,
+                   json_extract(o.resultat, '$.id_etape') AS id_etape_esup,
+                   json_extract(b.suivi, '$.demande_id') AS id_yousign,
+                   CASE WHEN b.demande IS NULL THEN 'avant envoi' ELSE 'préparation' END AS phase,
+                   CASE WHEN b.demande IS NULL THEN 'Relecture ESUP après 5 minutes'
+                        ELSE 'Vérification manuelle' END AS reprise,
+                   coalesce(json_extract(o.resultat, '$.detail'),
+                            json_extract(o.resultat, '$.motif'), 'Consulter le journal') AS motif,
+                   CASE WHEN b.demande IS NULL THEN
+                       datetime(coalesce(o.observed_at, e.received_at), '+5 minutes')
+                   END AS prochain_essai_utc
+            FROM derniers d JOIN events e ON e.id=d.id
+            LEFT JOIN observations o ON o.event_id=e.id
+            LEFT JOIN brouillons_yousign b ON b.demande=d.demande
+                AND (json_extract(o.resultat, '$.id_etape') IS NULL OR
+                     b.etape=CAST(json_extract(o.resultat, '$.id_etape') AS TEXT))
+            WHERE e.state IN ('erreur', 'erreur_yousign')
+              AND coalesce(json_extract(b.suivi, '$.en_cours'), '') = ''
+              AND NOT coalesce(json_extract(b.suivi, '$.activation_bloquee'), 0)
+              AND json_extract(b.suivi, '$.erreur') IS NULL
+            UNION ALL
+            SELECT demande, NULL, NULL, etape, json_extract(suivi, '$.demande_id'),
+                   CASE WHEN json_extract(suivi, '$.activation_bloquee') THEN 'activation'
+                        WHEN json_extract(suivi, '$.en_cours') != ''
+                        THEN json_extract(suivi, '$.en_cours') ELSE 'suivi' END,
+                   CASE WHEN json_extract(suivi, '$.activation_bloquee')
+                          OR json_extract(suivi, '$.en_cours') != ''
+                        THEN 'Vérification manuelle' ELSE 'Au prochain cycle' END,
+                   coalesce(json_extract(suivi, '$.erreur'),
+                            'Vérifier le résultat de la préparation dans Yousign'), NULL
+            FROM brouillons_yousign
+            WHERE json_extract(suivi, '$.en_cours') != ''
+               OR json_extract(suivi, '$.activation_bloquee')
+               OR json_extract(suivi, '$.erreur') IS NOT NULL
+        """)
         connexion.commit()
     finally:
         # finally est exécuté même lorsqu'une erreur interrompt le bloc try.
@@ -114,11 +158,22 @@ def lire_evenement(identifiant):
         connexion.close()
 
 
-def lister_evenements():
-    """Lire les événements dans leur ordre de réception, sans décision métier."""
+def evenements_a_traiter():
+    """Sélectionner la dernière notification par demande, puis vérifier son échéance."""
     connexion = sqlite3.connect(CHEMIN_BASE, timeout=10)
     try:
-        return connexion.execute("SELECT id, payload, state FROM events ORDER BY id").fetchall()
+        return connexion.execute("""
+            SELECT e.id FROM events e
+            WHERE e.id IN (
+                SELECT max(id) FROM events GROUP BY json_extract(payload, '$.signRequestId')
+            ) AND (
+                e.state IN ('received', 'a_reprendre', 'a_envoyer')
+                OR e.id IN (
+                    SELECT evenement FROM dossiers_a_verifier
+                    WHERE prochain_essai_utc <= CURRENT_TIMESTAMP
+                )
+            ) ORDER BY e.id
+        """).fetchall()
     finally:
         connexion.close()
 
@@ -209,5 +264,18 @@ def lister_brouillons():
     connexion = sqlite3.connect(CHEMIN_BASE, timeout=10)
     try:
         return connexion.execute("SELECT demande, etape, suivi FROM brouillons_yousign").fetchall()
+    finally:
+        connexion.close()
+
+
+def noter_erreur_preparation(demande, etape, motif):
+    """Associer l’erreur au brouillon si un envoi a déjà été engagé."""
+    connexion = sqlite3.connect(CHEMIN_BASE, timeout=10)
+    try:
+        connexion.execute("""
+            UPDATE brouillons_yousign SET suivi=json_set(suivi, '$.erreur', ?)
+            WHERE demande=? AND etape=? AND json_extract(suivi, '$.en_cours') != ''
+        """, (motif, demande, etape))
+        connexion.commit()
     finally:
         connexion.close()

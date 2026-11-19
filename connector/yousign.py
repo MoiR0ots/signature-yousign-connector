@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 import shutil
 import tempfile
 import uuid
@@ -48,7 +49,15 @@ def appeler_api(methode, chemin, donnees=None, fichier=None):
     except HTTPError as erreur:
         # Ne jamais journaliser la requête, son en-tête d'authentification ou le
         # corps complet d'une réponse contenant des informations personnelles.
-        raise ValueError(f"Yousign répond HTTP {erreur.code} sur {chemin}") from None
+        message = f"Yousign répond HTTP {erreur.code} sur {chemin}"
+        try:
+            contenu = json.loads(erreur.read(16384))
+        except (ValueError, OSError):
+            contenu = {}
+        code = contenu.get("type") if isinstance(contenu, dict) else None
+        if isinstance(code, str) and re.fullmatch(r"[a-zA-Z0-9_.-]{1,160}", code):
+            message += f" ({code})"
+        raise ValueError(message) from None
 
 
 def preparer_signataires(observation):
@@ -79,7 +88,12 @@ def preparer_signataires(observation):
             if champ["page"] < 1 or champ["x"] < 0 or champ["y"] < 0:
                 raise ValueError("Page ou coordonnées incorrectes")
             if not 85 <= champ["width"] <= 2000 or not 37 <= champ["height"] <= 1000:
-                raise ValueError("Dimensions du champ incompatibles avec Yousign")
+                raise ValueError(
+                    f"Destinataire ESUP {personne['id_destinataire']}, page {champ['page']}, "
+                    f"position ({champ['x']}, {champ['y']}) : champ de "
+                    f"{champ['width']} × {champ['height']}. "
+                    "Largeur attendue de 85 à 2000, hauteur de 37 à 1000"
+                )
             champs.append(champ)
         if not champs:
             raise ValueError("Un signataire n'a aucun emplacement")

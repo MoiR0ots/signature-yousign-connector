@@ -47,8 +47,8 @@ Le fonctionnement multi-document reste à développer.
 Les points ouverts sont l'absence de l'apparence de signature Sandbox dans
 l'aperçu ESUP malgré sa présence dans le PDF téléchargé, la livraison des mails
 à vérifier sur l'environnement cible, ainsi que les alertes et certaines reprises
-après erreur. Une panne avant envoi peut encore bloquer une demande ; ce point
-identifié doit être corrigé ultérieurement.
+après erreur. Le timer reprend les échecs avant envoi après cinq minutes. La vue SQLite
+`dossiers_a_verifier` présente les motifs et les opérations à vérifier.
 
 Cette validation Sandbox porte sur le parcours technique. Elle ne constitue pas
 une validation de la signature en environnement Yousign de production.

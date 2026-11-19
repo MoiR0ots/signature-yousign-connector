@@ -23,12 +23,14 @@ def construire_demande():
     """Deux étapes, dont la dernière comporte un destinataire externe fictif."""
     derniere = {
         "id": 40,
-        "allSignToComplete": True,
+        "allSignToComplete": True, "signType": "signature",
         "recipients": [{
             "id": 41, "signed": False,
-            "user": {"firstname": "Test", "email": "test@example.org", "userType": "external"},
+            "user": {"firstname": "Test", "name": "Exemple", "email": "test@example.org", "userType": "external"},
         }],
-        "signRequestParams": [{"recipientId": 41, "signPageNumber": 1, "xPos": 216}],
+        "signRequestParams": [{"recipientId": 41, "signPageNumber": 1, "xPos": 216,
+                               "yPos": 50, "signWidth": 100, "signHeight": 50,
+                               "signDocumentNumber": 0, "rotate": 0}],
     }
     return {
         "id": 105, "status": "pending",
@@ -188,3 +190,25 @@ def test_emplacement_generique_pour_un_seul_destinataire():
     etape["recipients"].append({"id": 42, "signed": False, "user": {}})
     resultat = analyser_demande(demande, evenement)
     assert all(not personne["emplacements"] for personne in resultat["signataires"])
+
+
+@pytest.mark.parametrize(("champ", "valeur", "motif"), [
+    ("signType", "visa", "type signature"),
+    ("allSignToComplete", False, "tous les destinataires"),
+    ("signWidth", 84, "Destinataire ESUP 41, page 1, position (216, 50) : champ de 84 × 50"),
+])
+def test_diagnostic_avant_telechargement(tmp_path, monkeypatch, champ, valeur, motif):
+    demande = construire_demande()
+    etape = demande["parentSignBook"]["liveWorkflow"]["currentStep"]
+    if champ == "signWidth":
+        etape["signRequestParams"][0][champ] = valeur
+    else:
+        etape[champ] = valeur
+    monkeypatch.setattr(donnees, "CHEMIN_BASE", tmp_path / "events.sqlite3")
+    monkeypatch.setattr(connecteur.esup, "lire_demande", lambda identifiant: demande)
+    monkeypatch.setattr(connecteur.esup, "telecharger_document", lambda *args: pytest.fail("Téléchargement"))
+    donnees.initialiser_base()
+    reception = donnees.enregistrer_evenement({"signRequestId": "105", "status": "pending", "step": "2"})
+    observation = connecteur.consulter_evenement(reception["event_id"])
+    assert motif in observation["detail"]
+    assert observation["etat"] == "erreur"
