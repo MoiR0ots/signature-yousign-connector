@@ -1,7 +1,7 @@
 # Connecteur ESUP / Yousign
 
 Le connecteur reçoit les notifications des circuits ESUP configurés pour lui.
-Il envoie uniquement leur **dernière étape** à Yousign, avec le PDF contenant les
+Il envoie uniquement leur **dernière étape** à Yousign, avec les PDF et les
 signatures internes précédentes, puis réintègre le document signé comme nouvelle
 version dans ESUP et valide la dernière étape. Le parapheur est clôturé lorsque
 toutes ses demandes sont terminées. Ce retour nécessite l'extension ESUP installée
@@ -65,17 +65,19 @@ de chaque commande de diagnostic, puis utilisées sans initialisation répétée
    secondes. Un décalage persistant reste `a_reprendre` pour le prochain passage.
 5. Pour la dernière étape, il récupère les destinataires, leurs placements et le PDF
    courant. Les comptes ESUP internes (`ldap`) et externes sont acceptés.
-6. Il vérifie la cohérence du PDF et des signataires avec le contexte ESUP, qu'il
-   sauvegarde dans SQLite avant tout envoi. Il prépare un unique brouillon Yousign
-   par demande et étape, en mémorisant chaque
-   identifiant obtenu, puis active la demande. Yousign envoie systématiquement les
-   invitations ; le connecteur n'utilise pas le SMTP ESUP.
-7. Les passages suivants consultent le statut. En `done`, le PDF signé est conservé
-   séparément du PDF d'origine. Une erreur de téléchargement sera retentée.
-8. Il envoie ce PDF à `POST /ws/signrequests/{id}/external-completion`, avec le
-   contexte initial et la référence stable `yousign:<identifiant Yousign>`.
-   ESUP ajoute la version signée, valide la dernière étape et clôture le parapheur
-   si toutes ses demandes sont terminées. La confirmation est conservée dans SQLite.
+6. Il lit la liste ordonnée des demandes du parapheur dans le contexte ESUP,
+   puis vérifie chaque PDF et chaque emplacement. Il réserve un seul brouillon
+   Yousign par parapheur et étape, identifié dans SQLite par le numéro du parapheur
+   ESUP. Chaque signataire est ajouté une seule fois, avec ses champs sur les bons
+   documents. Yousign envoie les invitations après l’activation.
+7. En `done`, le connecteur télécharge chaque PDF signé par son identifiant Yousign.
+8. Il réintègre chaque résultat dans sa demande d’origine avec son contexte initial
+   et la référence stable `yousign:<identifiant Yousign>`. Chaque import est confirmé
+   dans SQLite. Une reprise continue avec les PDF dont le retour n’est pas confirmé.
+   ESUP clôture le parapheur après le dernier import.
+
+Le connecteur et l’extension ESUP doivent être déployés ensemble. En développement,
+une base vierge est requise lorsque le schéma SQLite change.
 
 Le timer systemd déclenche un passage après la fin du précédent. Un verrou empêche
 également deux passages manuels simultanés. Aucun traitement API n'est exécuté
@@ -121,7 +123,8 @@ serveur HTTP répond ; il ne vérifie ni SQLite ni les API.
 | `observations` | Dernière analyse par événement, règles de l’étape, motif, chemin du PDF courant et date UTC. |
 | `destinataires_observes` | Destinataires lus dans ESUP pour cet événement, avec leur identité et leur état de signature. |
 | `emplacements` | Une ligne par zone du destinataire observé, avec le document, la page, les coordonnées, les dimensions et les options de placement. |
-| `brouillons_yousign` | Une ligne par demande ESUP et étape. Elle porte le contexte initial, les identifiants du brouillon et du document, la progression, les erreurs et la confirmation du retour du PDF. |
+| `brouillons_yousign` | Une ligne par parapheur et étape, avec l’identifiant de l’envoi Yousign, son statut et ses erreurs. |
+| `documents` | Une ligne par PDF, avec sa position, sa demande ESUP, son contexte initial, son identifiant Yousign et la confirmation de son import. |
 | `signataires` | Correspondance entre destinataire ESUP et signataire Yousign, statut individuel et lien privé. |
 | `configuration_yousign` | URL de l’API liée à la base pour distinguer Sandbox et production. |
 
@@ -130,9 +133,9 @@ du connecteur, supprimer l’ancienne base `events.sqlite3`, puis redémarrer le
 service HTTP et le timer. Le connecteur crée les tables au premier cycle ou à
 la première notification.
 
-Pour consulter les signataires et leurs liens dans DBeaver, filtrer la table
-`signataires` sur la colonne `demande`. Les colonnes `demande` et `etape` la relient
-à `brouillons_yousign`. Les emplacements se retrouvent par `event_id` et `id_destinataire`.
+Dans DBeaver, filtrer `documents` ou `signataires` sur la colonne `parapheur`.
+Les colonnes `parapheur` et `etape` relient ces deux tables à `brouillons_yousign`.
+Les emplacements observés se retrouvent par `event_id` et `id_destinataire`.
 
 Les états d'événement principaux sont : `received`, `ignoree`, `a_reprendre`,
 `erreur`, `a_envoyer`, `transmis_yousign` et `erreur_yousign`. Une dernière étape
@@ -147,7 +150,7 @@ comme entièrement signé.
 Si l'appel de retour échoue, le prochain passage renvoie le même PDF, la même
 référence et le même contexte initial. Si ESUP avait déjà traité l'import mais
 que sa réponse avait été perdue, il répond `duplicate: true` sans ajouter une
-seconde version. La table `brouillons_yousign` conserve cette confirmation, notamment
+seconde version. La table `documents` conserve cette confirmation, notamment
 l'identifiant du document et le statut du parapheur. Un conflit HTTP 409 signifie
 qu'il faut vérifier manuellement le parapheur : le connecteur ne renouvelle pas
 le contexte pour forcer l'import. Les erreurs restent visibles dans le journal.
@@ -197,9 +200,11 @@ Un échec préserve un éventuel ancien PDF. Les fichiers ne sont pas purgés au
 
 Les coordonnées partent du coin supérieur gauche dans les deux systèmes.
 Le POC suppose `fixFactor=1` côté ESUP, une échelle de signature de 1, un PDF sans
-rotation, le document 0 et des placements explicites sans option toutes-pages ni
+rotation et des placements explicites sans option toutes-pages ni
 champ PDF préexistant. Les cas complexes sont refusés. Un emplacement générique
 sans destinataire est accepté seulement si l'étape contient une seule personne.
+Le circuit comporte une dernière étape commune. Chaque signataire doit avoir
+un emplacement sur chaque PDF.
 Le rendu Yousign reste à valider visuellement, notamment le ratio des signatures.
 Les essais utilisent une signature simple (`electronic_signature`) sans OTP (`no_otp`).
 

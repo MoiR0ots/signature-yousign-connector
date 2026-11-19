@@ -30,7 +30,7 @@ def creer_observation(tmp_path, monkeypatch):
     monkeypatch.setattr(traitement, "consulter_evenement", lambda identifiant: observation)
     contexte = {"signRequestId": 203, "expectedStepId": 209, "contextHash": "a" * 64,
                 "sourceDocumentId": 204, "sourceSha256": hashlib.sha256(pdf.read_bytes()).hexdigest()}
-    monkeypatch.setattr(esup, "lire_contexte_retour", lambda identifiant: dict(contexte))
+    monkeypatch.setattr(esup, "lire_contexte_retour", lambda identifiant: dict(contexte, signBookId=200, demandesDuParapheur=[203]))
     derniere = {
         "id": 209, "allSignToComplete": True, "signType": "signature",
         "recipients": [{"id": 210, "signed": False, "user": {
@@ -49,6 +49,21 @@ def creer_observation(tmp_path, monkeypatch):
     return reception["event_id"], observation
 
 
+def reserver_document_test():
+    contexte = esup.lire_contexte_retour("203")
+    contexte.pop("signBookId")
+    contexte.pop("demandesDuParapheur")
+    return donnees.reserver_brouillon("200", "209", {"203": contexte})
+
+
+def brouillon_pret(signataires):
+    suivi = reserver_document_test()
+    suivi.update(demande_id="demande-test", pret=True, en_cours="", signataires=signataires)
+    suivi["documents"]["203"]["document_id"] = "document-test"
+    donnees.sauvegarder_brouillon("200", "209", suivi)
+    return suivi
+
+
 def test_brouillon_et_relance_sans_double_creation(tmp_path, monkeypatch):
     evenement, observation = creer_observation(tmp_path, monkeypatch)
     appels = []
@@ -59,7 +74,7 @@ def test_brouillon_et_relance_sans_double_creation(tmp_path, monkeypatch):
         if methode == "POST" and chemin == "/signature_requests":
             # La sauvegarde doit précéder même le tout premier POST Yousign.
             historique = base.lister_brouillons()[0][2]
-            assert historique['contexte_esup']['expectedStepId'] == 209
+            assert historique['documents']['203']['contexte_esup']['expectedStepId'] == 209
         if chemin.endswith("/documents"):
             return {"id": "document-test"}
         if chemin.endswith("/signers"):
@@ -79,12 +94,12 @@ def test_brouillon_et_relance_sans_double_creation(tmp_path, monkeypatch):
     assert len(appels) == 4
     # Le contexte conservé suffit à refuser une préparation différente,
     # sans calculer une deuxième empreinte locale du PDF et des signataires.
-    contexte_modifie = dict(resultat["contexte_esup"], contextHash="b" * 64)
+    contexte_modifie = dict(resultat["documents"]["203"]["contexte_esup"], contextHash="b" * 64, signBookId=200, demandesDuParapheur=[203])
     monkeypatch.setattr(esup, "lire_contexte_retour", lambda identifiant: contexte_modifie)
     with pytest.raises(ValueError, match="contexte ESUP a changé"):
         traitement.preparer_brouillon(evenement, observation)
     assert len(appels) == 4
-    monkeypatch.setattr(esup, "lire_contexte_retour", lambda identifiant: resultat["contexte_esup"])
+    monkeypatch.setattr(esup, "lire_contexte_retour", lambda identifiant: dict(resultat["documents"]["203"]["contexte_esup"], signBookId=200, demandesDuParapheur=[203]))
     observation["signataires"][0]["email"] = "autre@example.org"
     with pytest.raises(ValueError, match="ont changé"):
         traitement.preparer_brouillon(evenement, observation)
@@ -157,15 +172,11 @@ def test_activation_email_et_recuperation_apres_signature(tmp_path, monkeypatch)
         return dict(etat)
 
     monkeypatch.setattr(yousign, 'appeler_api', repondre)
-    suivi = {'demande_id': 'demande-test', 'document_id': 'document-test',
-             'signataires': {'210': 'signataire-test'}, 'pret': True, 'en_cours': ''}
-    suivi['contexte_esup'] = esup.lire_contexte_retour('203')
-    donnees.reserver_brouillon('203', '209', esup.lire_contexte_retour('203'))
-    donnees.sauvegarder_brouillon('203', '209', suivi)
-    traitement.actualiser_demande( '203', '209', suivi)
+    suivi = brouillon_pret({"210": "signataire-test"})
+    traitement.actualiser_demande( '200', '209', suivi)
     assert all(methode != 'PATCH' for methode, chemin, donnees in appels)
     assert suivi['statut_yousign'] == 'ongoing'
-    traitement.actualiser_demande( '203', '209', suivi)
+    traitement.actualiser_demande( '200', '209', suivi)
     assert sum(chemin.endswith('/activate') for methode, chemin, donnees in appels) == 1
     etat['status'] = 'done'
 
@@ -174,8 +185,8 @@ def test_activation_email_et_recuperation_apres_signature(tmp_path, monkeypatch)
         destination.write_bytes(b'%PDF-1.7\n%%EOF')
 
     monkeypatch.setattr(yousign, 'telecharger_pdf_signe', telecharger)
-    traitement.actualiser_demande( '203', '209', suivi)
-    assert Path(suivi['document_signe']).exists()
+    traitement.actualiser_demande( '200', '209', suivi)
+    assert Path(suivi['documents']['203']['document_signe']).exists()
     assert 'liens_signature' not in suivi
 
 
@@ -190,13 +201,10 @@ def test_activation_refusee_ne_repete_pas_les_invitations(tmp_path, monkeypatch)
         return {'status': 'draft'}
 
     monkeypatch.setattr(yousign, 'appeler_api', repondre)
-    suivi = {'demande_id': 'demande-test', 'document_id': 'document-test',
-             'signataires': {}, 'pret': True, 'en_cours': ''}
-    donnees.reserver_brouillon('203', '209', esup.lire_contexte_retour('203'))
-    donnees.sauvegarder_brouillon('203', '209', suivi)
+    suivi = brouillon_pret({})
     with pytest.raises(ValueError, match='Refus Sandbox'):
-        traitement.actualiser_demande( '203', '209', suivi)
-    traitement.actualiser_demande( '203', '209', suivi)
+        traitement.actualiser_demande( '200', '209', suivi)
+    traitement.actualiser_demande( '200', '209', suivi)
     assert appels.count('POST') == 1
     assert suivi['activation_bloquee'] is True
 
@@ -243,7 +251,7 @@ def test_cycle_automatique_jusqu_au_pdf_signe(tmp_path, monkeypatch):
         assert connexion.execute('SELECT state FROM events').fetchone()[0] == 'transmis_yousign'
         suivi = donnees.lister_brouillons()[0][2]
         assert suivi['statut_yousign'] == 'done'
-        assert suivi['retour_esup']['documentId'] == 300
+        assert suivi['documents']['203']['retour_esup']['documentId'] == 300
     finally:
         connexion.close()
 
@@ -272,12 +280,7 @@ def test_pdf_modifie_refuse_avant_envoi(tmp_path, monkeypatch):
 def test_retour_repris_apres_perte_de_reponse(tmp_path, monkeypatch):
     """ESUP a importé le PDF, mais sa réponse au premier POST a été perdue."""
     creer_observation(tmp_path, monkeypatch)
-    contexte = esup.lire_contexte_retour('203')
-    suivi = {'demande_id': 'demande-test', 'document_id': 'document-test',
-             'signataires': {}, 'pret': True, 'en_cours': '',
-             'contexte_esup': contexte}
-    donnees.reserver_brouillon('203', '209', esup.lire_contexte_retour('203'))
-    donnees.sauvegarder_brouillon('203', '209', suivi)
+    brouillon_pret({})
     monkeypatch.setattr(yousign, 'lire_demande', lambda identifiant: {'status': 'done'})
     telechargements = []
 
@@ -306,7 +309,7 @@ def test_retour_repris_apres_perte_de_reponse(tmp_path, monkeypatch):
     assert envois[0] == envois[1]
     assert len(telechargements) == 1
     resultat = donnees.lister_brouillons()[0][2]
-    assert resultat['retour_esup']['duplicate'] is True
+    assert resultat['documents']['203']['retour_esup']['duplicate'] is True
 
 
 def test_reprise_avant_envoi_et_disparition_de_la_vue(tmp_path, monkeypatch):
@@ -360,9 +363,8 @@ def test_post_incertain_reste_visible_sans_relance(tmp_path, monkeypatch):
 
 def test_lien_initialement_vide_puis_disponible(tmp_path, monkeypatch):
     creer_observation(tmp_path, monkeypatch)
-    donnees.reserver_brouillon("203", "209", esup.lire_contexte_retour("203"))
-    suivi = {"demande_id": "test", "pret": True, "en_cours": "", "signataires": {"210": "a", "211": "b"},
-             "liens_signature": {"210": None, "211": None}}
+    suivi = brouillon_pret({"210": "a", "211": "b"})
+    suivi["liens_signature"] = {"210": None, "211": None}
     monkeypatch.setattr(yousign, "lire_demande", lambda demande: {
         "status": "ongoing", "signers": [{"id": "a", "status": "notified"}, {"id": "b", "status": "signed"}]
     })
@@ -373,8 +375,8 @@ def test_lien_initialement_vide_puis_disponible(tmp_path, monkeypatch):
         return {"status": "notified", "signature_link": "lien-fictif"}
 
     monkeypatch.setattr(yousign, "lire_signataire", lire)
-    traitement.actualiser_demande("203", "209", suivi)
-    traitement.actualiser_demande("203", "209", suivi)
+    traitement.actualiser_demande("200", "209", suivi)
+    traitement.actualiser_demande("200", "209", suivi)
     assert appels == ["a"]
     assert suivi["liens_signature"] == {"210": "lien-fictif"}
     assert suivi["statuts_signataires"] == {"210": "notified", "211": "signed"}
@@ -409,19 +411,118 @@ def test_ancienne_erreur_et_notification_plus_recente(tmp_path, monkeypatch):
 
 def test_suivi_relationnel_apres_reouverture(tmp_path, monkeypatch):
     creer_observation(tmp_path, monkeypatch)
-    contexte = esup.lire_contexte_retour("203")
-    suivi = donnees.reserver_brouillon("203", "209", contexte)
-    suivi.update(demande_id="demande-test", document_id="document-test", en_cours="", pret=True,
-                 statut_yousign="ongoing", active_le="2026-11-19T10:00:00Z",
-                 signataires={"210": "alice", "211": "bob"}, liens_signature={"211": "lien-fictif"},
+    suivi = brouillon_pret({"210": "alice", "211": "bob"})
+    suivi.update(statut_yousign="ongoing", active_le="2026-11-19T10:00:00Z",
+                 liens_signature={"211": "lien-fictif"},
                  statuts_signataires={"210": "signed", "211": "notified"})
-    donnees.sauvegarder_brouillon("203", "209", suivi)
-    assert donnees.lister_brouillons() == [("203", "209", suivi)]
+    donnees.sauvegarder_brouillon("200", "209", suivi)
+    assert donnees.lister_brouillons() == [("200", "209", suivi)]
     suivi.pop("liens_signature")
-    suivi.update(statut_yousign="done", termine_le="2026-11-19T11:00:00Z", document_signe="signe.pdf",
-                 retour_esup={"signRequestId": 203, "documentId": 300, "status": "completed",
-                              "signBookStatus": "completed", "duplicate": False})
-    donnees.sauvegarder_brouillon("203", "209", suivi)
-    assert donnees.lister_brouillons() == [("203", "209", suivi)]
+    suivi.update(statut_yousign="done", termine_le="2026-11-19T11:00:00Z")
+    suivi["documents"]["203"].update(
+        document_signe="signe.pdf",
+        retour_esup={"signRequestId": 203, "documentId": 300, "status": "completed",
+                     "signBookStatus": "completed", "duplicate": False},
+    )
+    donnees.sauvegarder_brouillon("200", "209", suivi)
+    assert donnees.lister_brouillons() == [("200", "209", suivi)]
     with sqlite3.connect(donnees.CHEMIN_BASE) as connexion:
         assert connexion.execute("SELECT lien_signature FROM signataires").fetchall() == [(None,), (None,)]
+
+
+def test_deux_pdf_un_brouillon_et_reprise_du_second_import(tmp_path, monkeypatch):
+    _, observation = creer_observation(tmp_path, monkeypatch)
+    seconde = donnees.enregistrer_evenement(
+        {"signRequestId": "201", "status": "pending", "step": "2"}
+    )["event_id"]
+    # L'ordre ESUP n'est pas l'ordre numérique des demandes.
+    demandes = [203, 201]
+    contexte = esup.lire_contexte_retour("203")
+    demande = esup.lire_demande("203")
+    params = demande["parentSignBook"]["liveWorkflow"]["currentStep"]["signRequestParams"]
+    params.append(dict(params[0], signDocumentNumber=1, xPos=51))
+    observation["signataires"][0]["emplacements"].append(
+        dict(observation["signataires"][0]["emplacements"][0], document=1, x=51)
+    )
+    pdfs = {}
+    for identifiant in demandes:
+        chemin = tmp_path / f"{identifiant}.pdf"
+        chemin.write_bytes(f"%PDF-1.7\n{identifiant}\n%%EOF".encode())
+        pdfs[str(identifiant)] = chemin
+
+    def lire_contexte(identifiant):
+        return dict(contexte, signRequestId=int(identifiant), demandesDuParapheur=demandes,
+                    sourceSha256=hashlib.sha256(pdfs[identifiant].read_bytes()).hexdigest())
+
+    monkeypatch.setattr(esup, "lire_contexte_retour", lire_contexte)
+    monkeypatch.setattr(esup, "lire_demande", lambda identifiant: dict(demande, id=int(identifiant)))
+    monkeypatch.setattr(esup, "telecharger_document", lambda identifiant, *args: str(pdfs[identifiant]))
+    monkeypatch.setattr(traitement, "consulter_evenement", lambda evenement:
+                        dict(observation, document_pdf=str(pdfs[donnees.lire_evenement(evenement)["signRequestId"]])))
+    requetes = []
+    statut = "draft"
+
+    def repondre(methode, chemin, donnees=None, fichier=None):
+        nonlocal statut
+        requetes.append((methode, chemin, donnees, fichier))
+        if chemin.endswith("/documents"):
+            assert donnees["name"] == f"ESUP-{fichier.stem}.pdf"
+            return {"id": fichier.stem}
+        if chemin.endswith("/signers"):
+            assert [(c["document_id"], c["x"]) for c in donnees["fields"]] == [("203", 37), ("201", 51)]
+            return {"id": "signataire"}
+        if chemin.endswith("/activate"):
+            statut = "ongoing"
+        if "/signers/" in chemin:
+            return {"status": "notified"}
+        return {"id": "unique", "status": statut}
+
+    monkeypatch.setattr(yousign, "appeler_api", repondre)
+    # Le deuxième document peut être celui qui déclenche l'envoi.
+    traitement.preparer_brouillon(seconde, dict(observation, document_pdf=str(pdfs["201"])))
+    traitement.traiter_evenements()
+    traitement.suivre_demandes()
+    assert [chemin for methode, chemin, _, _ in requetes if methode == "POST"] == [
+        "/signature_requests", "/signature_requests/unique/documents", "/signature_requests/unique/documents",
+        "/signature_requests/unique/signers", "/signature_requests/unique/activate",
+    ]
+
+    telechargements = []
+    imports = []
+
+    def telecharger(brouillon, document, destination):
+        telechargements.append(document)
+        destination.parent.mkdir(parents=True)
+        destination.write_bytes(pdfs[document].read_bytes())
+
+    def importer(identifiant, initial, reference, chemin):
+        imports.append(identifiant)
+        assert initial["signRequestId"] == int(identifiant)
+        assert Path(chemin).read_bytes() == pdfs[identifiant].read_bytes()
+        if imports == ["203", "201"]:
+            raise TimeoutError("Réponse perdue au deuxième import")
+        return {"signRequestId": int(identifiant), "documentId": int(identifiant) + 100,
+                "status": "completed", "signBookStatus": "completed" if identifiant == "201" else "pending",
+                "duplicate": identifiant == "201"}
+
+    monkeypatch.setattr(yousign, "telecharger_pdf_signe", telecharger)
+    monkeypatch.setattr(esup, "envoyer_document_signe", importer)
+    statut = "done"
+    traitement.suivre_demandes()
+    traitement.suivre_demandes()
+    traitement.suivre_demandes()
+    assert telechargements == ["203", "201"]
+    assert imports == ["203", "201", "201"]
+    suivi = donnees.lister_brouillons()[0][2]
+    assert suivi["documents"]["203"]["retour_esup"]["documentId"] == 303
+    assert suivi["documents"]["201"]["retour_esup"]["signBookStatus"] == "completed"
+
+
+def test_un_signataire_sans_emplacement_sur_un_pdf_est_refuse(tmp_path, monkeypatch):
+    evenement, observation = creer_observation(tmp_path, monkeypatch)
+    contexte = esup.lire_contexte_retour("203")
+    monkeypatch.setattr(esup, "lire_contexte_retour", lambda _: dict(contexte, demandesDuParapheur=[203, 201]))
+    monkeypatch.setattr(yousign, "creer_demande", lambda *args: pytest.fail("Brouillon créé avant validation"))
+    with pytest.raises(ValueError, match="doit signer chaque PDF"):
+        traitement.preparer_brouillon(evenement, observation)
+    assert donnees.lister_brouillons() == []

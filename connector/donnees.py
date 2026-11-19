@@ -110,31 +110,44 @@ def verifier_environnement(adresse_api):
             raise ValueError("Cette base utilise une autre API Yousign : choisir un nouveau dossier de données")
 
 
-def lire_suivi(connexion, ligne):
-    """Rassembler la ligne du brouillon et ses signataires pour le cycle en cours."""
-    suivi = {
-        "en_cours": ligne["en_cours"], "pret": bool(ligne["pret"]),
-        "demande_id": ligne["id_demande_yousign"], "document_id": ligne["id_document_yousign"],
+def lire_document(ligne):
+    document = {
+        "document_id": ligne["id_document_yousign"],
         "contexte_esup": {
             "signRequestId": int(ligne["demande"]), "expectedStepId": int(ligne["etape"]),
             "contextHash": ligne["empreinte_contexte"], "sourceDocumentId": ligne["id_document_source"],
             "sourceSha256": ligne["sha256_source"],
         },
-        "signataires": {},
     }
-    for champ in ("id_destinataire_en_cours", "erreur", "statut_yousign", "active_le", "termine_le", "document_signe"):
-        if ligne[champ] is not None:
-            suivi[champ] = ligne[champ]
-    if ligne["activation_bloquee"]:
-        suivi["activation_bloquee"] = True
+    if ligne["document_signe"] is not None:
+        document["document_signe"] = ligne["document_signe"]
     if ligne["id_document_retour"] is not None:
-        suivi["retour_esup"] = {
+        document["retour_esup"] = {
             "signRequestId": int(ligne["demande"]), "documentId": ligne["id_document_retour"],
             "status": ligne["statut_demande_retour"], "signBookStatus": ligne["statut_parapheur_retour"],
             "duplicate": bool(ligne["retour_doublon"]),
         }
-    for personne in connexion.execute("SELECT * FROM signataires WHERE demande=? AND etape=?",
-                                      (ligne["demande"], ligne["etape"])):
+    return document
+
+
+def lire_suivi(connexion, ligne):
+    cle_brouillon = (ligne["parapheur"], ligne["etape"])
+    suivi = {
+        "en_cours": ligne["en_cours"], "pret": bool(ligne["pret"]),
+        "demande_id": ligne["id_demande_yousign"], "signataires": {},
+        "documents": {
+            document["demande"]: lire_document(document)
+            for document in connexion.execute("""
+                SELECT * FROM documents WHERE parapheur=? AND etape=? ORDER BY position
+            """, cle_brouillon)
+        },
+    }
+    for champ in ("id_destinataire_en_cours", "erreur", "statut_yousign", "active_le", "termine_le"):
+        if ligne[champ] is not None:
+            suivi[champ] = ligne[champ]
+    if ligne["activation_bloquee"]:
+        suivi["activation_bloquee"] = True
+    for personne in connexion.execute("SELECT * FROM signataires WHERE parapheur=? AND etape=?", cle_brouillon):
         cle = personne["id_destinataire_esup"]
         suivi["signataires"][cle] = personne["id_signataire_yousign"]
         if personne["statut_yousign"] is not None:
@@ -144,51 +157,69 @@ def lire_suivi(connexion, ligne):
     return suivi
 
 
-def reserver_brouillon(demande, etape, contexte):
-    """Réserver le premier POST et conserver le contexte initial en une transaction."""
+def reserver_brouillon(parapheur, etape, contextes):
+    """Enregistrer l'envoi et ses PDF avant le premier POST Yousign."""
     with ouvrir_base() as connexion:
         connexion.row_factory = sqlite3.Row
-        connexion.execute("BEGIN IMMEDIATE")
-        connexion.execute("""
-            INSERT INTO brouillons_yousign (demande, etape, empreinte_contexte, id_document_source,
-                                            sha256_source, en_cours)
-            VALUES (?, ?, ?, ?, ?, '') ON CONFLICT (demande, etape) DO NOTHING
-        """, (demande, etape, contexte["contextHash"], contexte["sourceDocumentId"], contexte["sourceSha256"]))
-        ligne = connexion.execute("SELECT * FROM brouillons_yousign WHERE demande=? AND etape=?",
-                                  (demande, etape)).fetchone()
+        ajout = connexion.execute("""
+            INSERT INTO brouillons_yousign (parapheur, etape, en_cours)
+            VALUES (?, ?, 'creation') ON CONFLICT (parapheur, etape) DO NOTHING
+        """, (parapheur, etape))
+        if ajout.rowcount:
+            for position, (demande, contexte) in enumerate(contextes.items()):
+                connexion.execute("""
+                    INSERT INTO documents (parapheur, etape, demande, position, empreinte_contexte,
+                                           id_document_source, sha256_source)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                """, (parapheur, etape, demande, position, contexte["contextHash"],
+                      contexte["sourceDocumentId"], contexte["sourceSha256"]))
+        ligne = connexion.execute("SELECT * FROM brouillons_yousign WHERE parapheur=? AND etape=?",
+                                  (parapheur, etape)).fetchone()
         suivi = lire_suivi(connexion, ligne)
-        if suivi["en_cours"]:
-            raise ValueError("Préparation en cours ou résultat incertain : vérifier Yousign et SQLite avant reprise")
-        if suivi["contexte_esup"] != contexte:
-            raise ValueError("Le contexte ESUP a changé : vérifier la demande")
-        if not suivi["pret"]:
-            suivi["en_cours"] = "reprise" if suivi["demande_id"] else "creation"
-            connexion.execute("UPDATE brouillons_yousign SET en_cours=? WHERE demande=? AND etape=?",
-                              (suivi["en_cours"], demande, etape))
+        if not ajout.rowcount:
+            if not suivi["pret"]:
+                raise ValueError("Préparation en cours ou résultat incertain : vérifier Yousign et SQLite avant reprise")
+            initial = [(demande, doc["contexte_esup"]) for demande, doc in suivi["documents"].items()]
+            if initial != list(contextes.items()):
+                raise ValueError("Le contexte ESUP a changé : vérifier la demande")
         return suivi
 
 
-def sauvegarder_brouillon(demande, etape, suivi):
-    retour = suivi.get("retour_esup", {})
+def brouillon_du_document(demande, etape):
+    with ouvrir_base() as connexion:
+        return connexion.execute("""
+            SELECT b.pret FROM documents d
+            JOIN brouillons_yousign b ON b.parapheur=d.parapheur AND b.etape=d.etape
+            WHERE d.demande=? AND d.etape=?
+        """, (demande, etape)).fetchone()
+
+
+def sauvegarder_brouillon(parapheur, etape, suivi):
     with ouvrir_base() as connexion:
         connexion.execute("""
-            UPDATE brouillons_yousign SET id_demande_yousign=?, id_document_yousign=?, en_cours=?,
-                id_destinataire_en_cours=?, pret=?, activation_bloquee=?, erreur=?, statut_yousign=?, active_le=?, termine_le=?,
-                document_signe=?, id_document_retour=?, statut_demande_retour=?, statut_parapheur_retour=?,
-                retour_doublon=? WHERE demande=? AND etape=?
-        """, (suivi.get("demande_id"), suivi.get("document_id"), suivi["en_cours"],
-              suivi.get("id_destinataire_en_cours"), suivi["pret"],
-              suivi.get("activation_bloquee", False), suivi.get("erreur"), suivi.get("statut_yousign"),
-              suivi.get("active_le"), suivi.get("termine_le"), suivi.get("document_signe"),
-              retour.get("documentId"), retour.get("status"), retour.get("signBookStatus"),
-              retour.get("duplicate"), demande, etape))
+            UPDATE brouillons_yousign SET id_demande_yousign=?, en_cours=?,
+                id_destinataire_en_cours=?, pret=?, activation_bloquee=?, erreur=?,
+                statut_yousign=?, active_le=?, termine_le=? WHERE parapheur=? AND etape=?
+        """, (suivi.get("demande_id"), suivi["en_cours"], suivi.get("id_destinataire_en_cours"),
+              suivi["pret"], suivi.get("activation_bloquee", False), suivi.get("erreur"),
+              suivi.get("statut_yousign"), suivi.get("active_le"), suivi.get("termine_le"),
+              parapheur, etape))
+        for demande, document in suivi["documents"].items():
+            confirmation = document.get("retour_esup", {})
+            connexion.execute("""
+                UPDATE documents SET id_document_yousign=?, document_signe=?,
+                    id_document_retour=?, statut_demande_retour=?, statut_parapheur_retour=?, retour_doublon=?
+                WHERE parapheur=? AND etape=? AND demande=?
+            """, (document.get("document_id"), document.get("document_signe"), confirmation.get("documentId"),
+                  confirmation.get("status"), confirmation.get("signBookStatus"), confirmation.get("duplicate"),
+                  parapheur, etape, demande))
         for destinataire, identifiant in suivi["signataires"].items():
             connexion.execute("""
-                INSERT INTO signataires (demande, etape, id_destinataire_esup, id_signataire_yousign,
+                INSERT INTO signataires (parapheur, etape, id_destinataire_esup, id_signataire_yousign,
                                          statut_yousign, lien_signature)
-                VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (demande, etape, id_destinataire_esup)
+                VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (parapheur, etape, id_destinataire_esup)
                 DO UPDATE SET statut_yousign=excluded.statut_yousign, lien_signature=excluded.lien_signature
-            """, (demande, etape, destinataire, identifiant,
+            """, (parapheur, etape, destinataire, identifiant,
                   suivi.get("statuts_signataires", {}).get(destinataire),
                   suivi.get("liens_signature", {}).get(destinataire)))
 
@@ -197,12 +228,14 @@ def lister_brouillons():
     with ouvrir_base() as connexion:
         connexion.row_factory = sqlite3.Row
         connexion.execute("BEGIN")
-        return [(ligne["demande"], ligne["etape"], lire_suivi(connexion, ligne))
+        return [(ligne["parapheur"], ligne["etape"], lire_suivi(connexion, ligne))
                 for ligne in connexion.execute("SELECT * FROM brouillons_yousign")]
 
 
 def noter_erreur_preparation(demande, etape, motif):
     with ouvrir_base() as connexion:
         connexion.execute("""
-            UPDATE brouillons_yousign SET erreur=? WHERE demande=? AND etape=? AND en_cours != ''
-        """, (motif, demande, etape))
+            UPDATE brouillons_yousign SET erreur=?
+            WHERE parapheur=(SELECT parapheur FROM documents WHERE demande=? AND etape=?)
+                AND etape=? AND en_cours != ''
+        """, (motif, demande, etape, etape))

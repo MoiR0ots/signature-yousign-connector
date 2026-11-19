@@ -40,9 +40,11 @@ signature, retour du PDF, ajout d'une version signée et clôture ESUP.
 La prochaine étape est de reproduire ce parcours sur la VM de test avec les
 documents et circuits représentatifs des métiers.
 
-Le périmètre actuel est limité à un PDF par parapheur, avec tous les signataires
-de la dernière étape requis. Les placements complexes ne sont pas pris en charge.
-Le fonctionnement multi-document reste à développer.
+Le connecteur prépare une seule invitation Yousign par signataire pour tous les
+PDF d’un parapheur avec une dernière étape commune. Chaque signataire doit avoir
+un emplacement sur chaque PDF. Les placements complexes sont hors périmètre.
+Le retour multi-PDF est couvert par des tests automatisés et reste à vérifier
+de bout en bout sur l’environnement cible.
 
 Les points ouverts sont l'absence de l'apparence de signature Sandbox dans
 l'aperçu ESUP malgré sa présence dans le PDF téléchargé, la livraison des mails

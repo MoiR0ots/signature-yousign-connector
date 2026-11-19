@@ -32,8 +32,10 @@ def appeler_api(methode, chemin, donnees=None, fichier=None):
         # Multipart est le format exigé pour envoyer un fichier binaire.
         # Le PDF du POC est petit : construire ce corps en mémoire suffit.
         separateur = uuid.uuid4().hex
-        debut = (
-            f"--{separateur}\r\nContent-Disposition: form-data; name=\"nature\"\r\n\r\nsignable_document\r\n"
+        debut = f"--{separateur}\r\nContent-Disposition: form-data; name=\"nature\"\r\n\r\nsignable_document\r\n"
+        if donnees and "name" in donnees:
+            debut += f'--{separateur}\r\nContent-Disposition: form-data; name="name"\r\n\r\n{donnees["name"]}\r\n'
+        debut += (
             f"--{separateur}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"document.pdf\"\r\n"
             "Content-Type: application/pdf\r\n\r\n"
         )
@@ -60,7 +62,7 @@ def appeler_api(methode, chemin, donnees=None, fichier=None):
         raise ValueError(message) from None
 
 
-def preparer_signataires(observation):
+def preparer_signataires(observation, nombre_documents=1):
     """Traduire les placements simples ESUP pour les champs Yousign."""
     signataires = []
     for personne in observation["signataires"]:
@@ -73,11 +75,15 @@ def preparer_signataires(observation):
         champs = []
         for emplacement in personne["emplacements"]:
             # Ces autres cas demandent une conversion spécifique, hors premier POC.
-            if (emplacement["document"] != 0 or emplacement["rotation"] != 0
+            if (emplacement["rotation"] != 0
                     or emplacement["toutes_les_pages"] or emplacement["champ_pdf"]):
-                raise ValueError("Placement non pris en charge : rotation, champ PDF ou plusieurs documents/pages")
+                raise ValueError("Placement non pris en charge : rotation, champ PDF ou toutes les pages")
             if emplacement.get("echelle", 1) != 1:
                 raise ValueError("Une échelle de signature différente de 1 n'est pas encore prise en charge")
+            indice = emplacement["document"]
+            if type(indice) is not int or indice < 0 or (
+                    nombre_documents is not None and indice >= nombre_documents):
+                raise ValueError(f"Indice de document ESUP invalide : {indice}")
             champ = {
                 "type": "signature", "page": int(emplacement["page"]),
                 "x": int(emplacement["x"]), "y": int(emplacement["y"]),
@@ -94,9 +100,16 @@ def preparer_signataires(observation):
                     f"{champ['width']} × {champ['height']}. "
                     "Largeur attendue de 85 à 2000, hauteur de 37 à 1000"
                 )
+            champ["document"] = indice
             champs.append(champ)
         if not champs:
             raise ValueError("Un signataire n'a aucun emplacement")
+        if nombre_documents is not None and {
+            champ["document"] for champ in champs
+        } != set(range(nombre_documents)):
+            raise ValueError(
+                f"Le destinataire ESUP {personne['id_destinataire']} doit signer chaque PDF du parapheur"
+            )
         signataires.append({
             "id_esup": personne["id_destinataire"],
             "info": {"first_name": personne["prenom"], "last_name": personne["nom"],
@@ -108,24 +121,28 @@ def preparer_signataires(observation):
     return signataires
 
 
-def creer_demande(demande, etape):
+def creer_demande(parapheur, etape):
     """Créer un brouillon ; son activation est une opération distincte."""
     return appeler_api("POST", "/signature_requests", {
-        "name": f"ESUP {demande} - étape {etape}",
-        "external_id": f"esup-{demande}-etape-{etape}",
+        "name": f"Parapheur ESUP {parapheur} - étape {etape}",
+        "external_id": f"esup-parapheur-{parapheur}-etape-{etape}",
         "delivery_mode": "email",
         "ordered_signers": False,
     })
 
 
-def ajouter_document(identifiant_demande, pdf):
-    return appeler_api("POST", "/signature_requests/" + identifiant_demande + "/documents", fichier=pdf)
+def ajouter_document(identifiant_demande, pdf, demande_esup=None):
+    nom = {"name": f"ESUP-{int(demande_esup)}.pdf"} if demande_esup is not None else None
+    return appeler_api("POST", "/signature_requests/" + identifiant_demande + "/documents",
+                       donnees=nom, fichier=pdf)
 
 
-def ajouter_signataire(identifiant_demande, identifiant_document, personne):
+def ajouter_signataire(identifiant_demande, identifiants_documents, personne):
     champs = []
     for champ in personne["fields"]:
-        champs.append(dict(champ, document_id=identifiant_document))
+        champ = champ.copy()
+        champ["document_id"] = identifiants_documents[champ.pop("document")]
+        champs.append(champ)
     return appeler_api("POST", "/signature_requests/" + identifiant_demande + "/signers", {
         "info": personne["info"], "fields": champs,
         "signature_level": "electronic_signature", "signature_authentication_mode": "no_otp",

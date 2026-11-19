@@ -129,7 +129,7 @@ def consulter_evenement(identifiant_evenement):
                 # Les documents suivent le dossier de la base : aucun chemin
                 # supplémentaire à configurer dans le playbook.
                 verifier_etape(resultat)
-                yousign.preparer_signataires(resultat)
+                yousign.preparer_signataires(resultat, nombre_documents=None)
                 resultat["document_pdf"] = esup.telecharger_document(
                     evenement["signRequestId"], resultat["id_etape"],
                     donnees.CHEMIN_BASE.parent / "documents",
@@ -164,60 +164,84 @@ def preparer_brouillon(identifiant_evenement, observation):
     demande = notification["signRequestId"]
     etape = str(observation["id_etape"])
     verifier_etape(observation)
-    signataires = yousign.preparer_signataires(observation)
-    pdf = Path(observation["document_pdf"])
-    # Ce contexte sera présenté tel quel au retour. Il doit correspondre au PDF
-    # et aux signataires que nous allons réellement envoyer, avant tout POST.
-    contexte = esup.lire_contexte_retour(demande)
-    if str(contexte["signRequestId"]) != demande or str(contexte["expectedStepId"]) != etape:
-        raise ValueError("L'étape ESUP a changé avant l'envoi")
-    if contexte["sourceSha256"] != hashlib.sha256(pdf.read_bytes()).hexdigest():
-        raise ValueError("Le PDF ESUP a changé avant l'envoi")
-    # Une modification a pu survenir depuis l'observation. Relire les signataires
-    # entre deux lectures du contexte évite de mémoriser un état plus récent
-    # tout en envoyant les anciens placements ou destinataires.
+    contexte_annonce = esup.lire_contexte_retour(demande)
+    parapheur = str(contexte_annonce["signBookId"])
+    demandes = contexte_annonce["demandesDuParapheur"]
+    if (not isinstance(demandes, list) or any(type(item) is not int or item <= 0 for item in demandes)
+            or int(demande) not in demandes or len(set(demandes)) != len(demandes)):
+        raise ValueError("Liste de documents ESUP incohérente")
+    signataires = yousign.preparer_signataires(observation, len(demandes))
+
+    contextes = {}
+    pdfs = {}
+    for identifiant in map(str, demandes):
+        contexte = contexte_annonce if identifiant == demande else esup.lire_contexte_retour(identifiant)
+        if (str(contexte["signRequestId"]) != identifiant or str(contexte["expectedStepId"]) != etape
+                or str(contexte["signBookId"]) != parapheur or contexte["demandesDuParapheur"] != demandes):
+            raise ValueError("Le parapheur ESUP a changé avant l'envoi")
+        chemin = observation["document_pdf"] if identifiant == demande else esup.telecharger_document(
+            identifiant, etape, donnees.CHEMIN_BASE.parent / "documents",
+        )
+        pdf = Path(chemin)
+        if contexte["sourceSha256"] != hashlib.sha256(pdf.read_bytes()).hexdigest():
+            raise ValueError(f"Le PDF ESUP a changé avant l'envoi (demande {identifiant})")
+        contextes[identifiant] = contexte.copy()
+        pdfs[identifiant] = pdf
+
+    # Relire les signataires entre deux lectures du contexte avant tout POST.
     observation_actuelle = analyser_demande(esup.lire_demande(demande), notification)
     if observation_actuelle["etat"] != "derniere_etape":
         raise ValueError("La demande ESUP n'est plus disponible à sa dernière étape")
     verifier_etape(observation_actuelle)
-    if yousign.preparer_signataires(observation_actuelle) != signataires:
+    if yousign.preparer_signataires(observation_actuelle, len(demandes)) != signataires:
         raise ValueError("Les signataires ou leurs emplacements ont changé avant l'envoi")
-    if esup.lire_contexte_retour(demande) != contexte:
-        raise ValueError("Le contexte ESUP a changé pendant la préparation")
-    # Le contexte ESUP couvre déjà le PDF, les destinataires et les placements.
-    suivi = donnees.reserver_brouillon(demande, etape, contexte)
+    for identifiant, contexte in contextes.items():
+        if esup.lire_contexte_retour(identifiant) != contexte:
+            raise ValueError("Le contexte ESUP a changé pendant la préparation")
+
+    for contexte in contextes.values():
+        # La liste et le parapheur sont déjà représentés par les lignes documents.
+        contexte.pop("demandesDuParapheur")
+        contexte.pop("signBookId")
+    suivi = donnees.reserver_brouillon(parapheur, etape, contextes)
     if suivi["pret"]:
         return suivi
     if not suivi["demande_id"]:
-        reponse = yousign.creer_demande(demande, etape)
+        reponse = yousign.creer_demande(parapheur, etape)
         suivi["demande_id"] = reponse["id"]
-        donnees.sauvegarder_brouillon(demande, etape, suivi)
-    if not suivi["document_id"]:
-        suivi["en_cours"] = "document"
-        donnees.sauvegarder_brouillon(demande, etape, suivi)
-        reponse = yousign.ajouter_document(suivi["demande_id"], pdf)
-        suivi["document_id"] = reponse["id"]
-        donnees.sauvegarder_brouillon(demande, etape, suivi)
+        donnees.sauvegarder_brouillon(parapheur, etape, suivi)
+    documents = suivi["documents"]
+    for identifiant, document in documents.items():
+        if not document["document_id"]:
+            suivi["en_cours"] = "document"
+            donnees.sauvegarder_brouillon(parapheur, etape, suivi)
+            reponse = yousign.ajouter_document(suivi["demande_id"], pdfs[identifiant],
+                                               identifiant)
+            document["document_id"] = reponse["id"]
+            donnees.sauvegarder_brouillon(parapheur, etape, suivi)
+    ids_documents = [document["document_id"] for document in documents.values()]
     for personne in signataires:
         cle = str(personne["id_esup"])
         if cle in suivi["signataires"]:
             continue
         suivi["en_cours"] = "signataire"
         suivi["id_destinataire_en_cours"] = cle
-        donnees.sauvegarder_brouillon(demande, etape, suivi)
-        reponse = yousign.ajouter_signataire(suivi["demande_id"], suivi["document_id"], personne)
+        donnees.sauvegarder_brouillon(parapheur, etape, suivi)
+        reponse = yousign.ajouter_signataire(suivi["demande_id"],
+                                               ids_documents,
+                                               personne)
         suivi["signataires"][cle] = reponse["id"]
-        donnees.sauvegarder_brouillon(demande, etape, suivi)
+        donnees.sauvegarder_brouillon(parapheur, etape, suivi)
     if yousign.lire_demande(suivi["demande_id"])["status"] != "draft":
         raise ValueError("La demande Yousign n'est pas en brouillon")
     suivi["pret"] = True
     suivi["en_cours"] = ""
     suivi.pop("id_destinataire_en_cours", None)
-    donnees.sauvegarder_brouillon(demande, etape, suivi)
+    donnees.sauvegarder_brouillon(parapheur, etape, suivi)
     return suivi
 
 
-def actualiser_demande(demande, etape, suivi):
+def actualiser_demande(parapheur, etape, suivi):
     """Activer un brouillon prêt, puis réintégrer son PDF signé dans ESUP."""
     reponse = yousign.lire_demande(suivi["demande_id"])
     # Une activation déjà faite n'est jamais répétée, même après redémarrage.
@@ -233,14 +257,14 @@ def actualiser_demande(demande, etape, suivi):
             # une nouvelle activation. Le cycle suivant relira tout de même GET.
             suivi["activation_bloquee"] = True
             suivi["erreur"] = str(erreur)
-            donnees.sauvegarder_brouillon(demande, etape, suivi)
+            donnees.sauvegarder_brouillon(parapheur, etape, suivi)
             raise
     suivi["statut_yousign"] = reponse["status"]
     suivi["active_le"] = reponse.get("activated_at")
     if reponse["status"] != "draft":
         suivi.pop("activation_bloquee", None)
         suivi.pop("erreur", None)
-    donnees.sauvegarder_brouillon(demande, etape, suivi)
+    donnees.sauvegarder_brouillon(parapheur, etape, suivi)
 
     if reponse["status"] == "ongoing":
         liens = suivi.setdefault("liens_signature", {})
@@ -258,38 +282,38 @@ def actualiser_demande(demande, etape, suivi):
                 liens[destinataire] = personne.get("signature_link")
             if statut:
                 statuts[destinataire] = statut
-        donnees.sauvegarder_brouillon(demande, etape, suivi)
+        donnees.sauvegarder_brouillon(parapheur, etape, suivi)
     elif reponse["status"] == "done":
         suivi["termine_le"] = reponse.get("completed_at")
-        reintegrer_document_signe(demande, etape, suivi)
+        reintegrer_document_signe(parapheur, etape, suivi)
     return suivi
 
 
-def reintegrer_document_signe(demande, etape, suivi):
+def reintegrer_document_signe(parapheur, etape, suivi):
     """Conserver le PDF final, l'envoyer à ESUP et mémoriser sa confirmation."""
     suivi.pop("liens_signature", None)
-    destination = donnees.CHEMIN_BASE.parent / "documents" / demande / etape / "document-yousign.pdf"
-    if not suivi.get("document_signe") or not destination.exists():
-        yousign.telecharger_pdf_signe(suivi["demande_id"], suivi["document_id"], destination)
-        suivi["document_signe"] = str(destination)
-    # Enregistrer le fichier avant l'import pour le réutiliser en cas de reprise.
-    donnees.sauvegarder_brouillon(demande, etape, suivi)
-    if not suivi.get("retour_esup"):
-        contexte = suivi["contexte_esup"]
-        if str(contexte["signRequestId"]) != demande or str(contexte["expectedStepId"]) != etape:
+    documents = suivi["documents"]
+    for identifiant, document in documents.items():
+        destination = donnees.CHEMIN_BASE.parent / "documents" / identifiant / etape / "document-yousign.pdf"
+        if not document.get("document_signe") or not destination.exists():
+            yousign.telecharger_pdf_signe(suivi["demande_id"], document["document_id"], destination)
+            document["document_signe"] = str(destination)
+        donnees.sauvegarder_brouillon(parapheur, etape, suivi)
+        if document.get("retour_esup"):
+            continue
+        contexte = document["contexte_esup"]
+        if str(contexte["signRequestId"]) != identifiant or str(contexte["expectedStepId"]) != etape:
             raise ValueError("Le contexte initial ne correspond pas à la demande ESUP")
-        # Le PDF et son chemin sont déjà validés et sauvegardés ci-dessus.
-        # Si la réponse se perd après l'import, le prochain cycle renvoie la même
-        # référence : ESUP reconnaît l'import et ne crée pas une seconde version.
+        # La référence est stable et l'extension vérifie les doublons par demande ESUP.
         confirmation = esup.envoyer_document_signe(
-            demande, contexte, "yousign:" + suivi["demande_id"], suivi["document_signe"],
+            identifiant, contexte, "yousign:" + suivi["demande_id"], document["document_signe"],
         )
-        if (str(confirmation.get("signRequestId")) != demande
+        if (str(confirmation.get("signRequestId")) != identifiant
                 or confirmation.get("status") != "completed" or not confirmation.get("documentId")):
             raise ValueError("La confirmation de l'import ESUP est inattendue")
-        suivi["retour_esup"] = confirmation
-        donnees.sauvegarder_brouillon(demande, etape, suivi)
-        journal.info("Demande ESUP %s : PDF final importé, dernière étape validée", demande)
+        document["retour_esup"] = confirmation
+        donnees.sauvegarder_brouillon(parapheur, etape, suivi)
+        journal.info("Demande ESUP %s : PDF final importé, dernière étape validée", identifiant)
 
 
 def executer_cycle():
@@ -319,8 +343,13 @@ def traiter_evenements():
         observation = consulter_evenement(identifiant)
         if observation["etat"] != "derniere_etape":
             continue
+        demande = donnees.lire_evenement(identifiant)["signRequestId"]
         try:
-            preparer_brouillon(identifiant, observation)
+            commun = donnees.brouillon_du_document(demande, str(observation["id_etape"]))
+            if commun is None:
+                preparer_brouillon(identifiant, observation)
+            elif not commun[0]:
+                raise ValueError("Préparation du parapheur en cours ou résultat incertain : vérifier Yousign et SQLite")
             journal.info("Événement %s : brouillon prêt", identifiant)
         except Exception as erreur:
             # Pas de POST répété aveuglément : le suivi garde la dernière phase
@@ -329,7 +358,6 @@ def traiter_evenements():
             donnees.enregistrer_observation(identifiant, observation, "erreur_yousign")
             # Après réservation, le suivi reste visible même si une nouvelle
             # notification arrive pour la même demande.
-            demande = donnees.lire_evenement(identifiant)["signRequestId"]
             donnees.noter_erreur_preparation(demande, str(observation["id_etape"]), str(erreur))
             journal.error("Événement %s : %s", identifiant, erreur)
             continue
@@ -338,24 +366,27 @@ def traiter_evenements():
 
 def suivre_demandes():
     """Suivre les demandes prêtes et réintégrer les PDF terminés dans ESUP."""
-    for demande, etape, suivi in donnees.lister_brouillons():
+    for parapheur, etape, suivi in donnees.lister_brouillons():
         if not suivi["pret"] or suivi["en_cours"]:
             continue
-        if suivi.get("statut_yousign") == "done" and suivi.get("retour_esup") and suivi.get("document_signe"):
-            if Path(suivi["document_signe"]).exists():
-                continue
+        documents = suivi["documents"].values()
+        if suivi.get("statut_yousign") == "done" and all(
+            doc.get("retour_esup") and doc.get("document_signe") and Path(doc["document_signe"]).exists()
+            for doc in documents
+        ):
+            continue
         if suivi.get("statut_yousign") in ("canceled", "expired", "declined", "deleted", "rejected"):
             continue
         try:
             ancien_statut = suivi.get("statut_yousign")
-            actualiser_demande(demande, etape, suivi)
+            actualiser_demande(parapheur, etape, suivi)
             if suivi.get("statut_yousign") != ancien_statut:
-                journal.info("Demande ESUP %s : Yousign %s", demande, suivi.get("statut_yousign"))
+                journal.info("Parapheur ESUP %s : Yousign %s", parapheur, suivi.get("statut_yousign"))
         except Exception as erreur:
             if not suivi.get("activation_bloquee"):
                 suivi["erreur"] = str(erreur)
-                donnees.sauvegarder_brouillon(demande, etape, suivi)
-            journal.error("Demande ESUP %s : %s", demande, erreur)
+                donnees.sauvegarder_brouillon(parapheur, etape, suivi)
+            journal.error("Parapheur ESUP %s : %s", parapheur, erreur)
 
 
 if __name__ == "__main__":
